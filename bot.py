@@ -6,7 +6,9 @@ import os
 import shutil
 import tempfile
 import random
+import html
 from datetime import datetime, timezone
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -1045,6 +1047,37 @@ async def show_purchase_confirmation(callback: types.CallbackQuery):
     ]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
 
+def md_table_escape(text) -> str:
+    """Keeps a value from breaking a markdown table cell or rich-text syntax."""
+    return str(text).replace("|", "\\|").replace("`", "'").replace("\n", " ").strip()
+
+async def send_rich_message(chat_id, markdown_text: str, fallback_html: str = None):
+    """Sends a Telegram 'rich message' (Bot API 10.1+ sendRichMessage: real
+    headings, tables, etc.) built from the given markdown. If the rich
+    endpoint rejects the call or errors out for any reason, falls back to a
+    normal HTML message (fallback_html) so the notification is never lost.
+    Returns True if the rich message was sent, False if it fell back
+    (or failed outright with no fallback given)."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage"
+    payload = {"chat_id": chat_id, "rich_message": {"markdown": markdown_text}}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return True
+                print(f"sendRichMessage rejected: {data}")
+    except Exception as e:
+        print(f"sendRichMessage error: {e}")
+
+    if fallback_html:
+        try:
+            await bot.send_message(chat_id, fallback_html, parse_mode="HTML")
+        except Exception as e:
+            print(f"Rich-message fallback send error: {e}")
+    return False
+
 @dp.message(Command("groupid"))
 async def cmd_groupid(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -1063,30 +1096,63 @@ async def send_detailed_purchase_log(account: dict, buyer: types.User, price: fl
     sold_at = account.get("sold_at")
     sold_at_str = sold_at.strftime("%d %b %Y, %I:%M %p") if sold_at else "Just now"
 
-    buyer_name = buyer.full_name or "Unknown"
-    buyer_username = f"@{buyer.username}" if buyer.username else "Not set"
-    buyer_link = f"[{buyer_name}](tg://user?id={buyer.id})"
+    buyer_name = html.escape(buyer.full_name or "Unknown")
+    buyer_username = f"@{html.escape(buyer.username)}" if buyer.username else "Not set"
+    buyer_link = f'<a href="tg://user?id={buyer.id}">{buyer_name}</a>'
 
+    acc_username_display = f"@{html.escape(acc_username)}" if acc_username else "Not set"
+
+    divider = "━━━━━━━━━━━━━━━━━━━━"
     text = (
-        "🛒 **New Account Sold!**\n\n"
-        f"📱 Phone: `{phone}`\n"
-        f"🆔 Account User ID: `{acc_tg_user_id or 'Unknown'}`\n"
-        f"📛 Account Username: {f'@{acc_username}' if acc_username else 'Not set'}\n"
-        f"🔐 2-Step Verification: `{'ON' if two_step_enabled else 'OFF'}`\n"
-        f"🔑 2-Step Password: `{two_step if two_step else 'None'}`\n"
-        f"🔑 Session String:\n`{session_string}`\n\n"
+        "🛒 <b>NEW ACCOUNT SOLD</b>\n"
+        f"{divider}\n\n"
+        "📦 <b>Account Details</b>\n"
+        f"📱 Phone: <code>{html.escape(str(phone))}</code>\n"
+        f"🆔 User ID: <code>{html.escape(str(acc_tg_user_id or 'Unknown'))}</code>\n"
+        f"📛 Username: {acc_username_display}\n"
+        f"🔐 2-Step: <code>{'ON' if two_step_enabled else 'OFF'}</code>\n"
+        f"🔑 Password: <code>{html.escape(str(two_step) if two_step else 'None')}</code>\n"
+        f"🔑 Session:\n<code>{html.escape(str(session_string))}</code>\n\n"
+        f"{divider}\n"
+        "💳 <b>Transaction</b>\n"
         f"💰 Price: ₹{price:.2f}\n"
-        f"🕐 Purchased At: {sold_at_str}\n\n"
-        f"👤 Buyer: {buyer_link}\n"
-        f"🆔 Buyer ID: `{buyer.id}`\n"
-        f"📛 Buyer Username: {buyer_username}\n\n"
-        f"📨 OTP Deliveries: 0 so far"
+        f"🕐 Time: {sold_at_str}\n\n"
+        f"{divider}\n"
+        "👤 <b>Buyer</b>\n"
+        f"Name: {buyer_link}\n"
+        f"ID: <code>{buyer.id}</code>\n"
+        f"Username: {buyer_username}\n\n"
+        f"{divider}\n"
+        "📨 OTP Deliveries: <b>0</b> so far"
     )
 
-    try:
-        await bot.send_message(DETAILED_LOG_GROUP_ID, text, parse_mode="Markdown")
-    except Exception as e:
-        print(f"Detailed log group error: {e}")
+    md_buyer_name = md_table_escape(buyer.full_name or "Unknown")
+    md_buyer_username = f"@{buyer.username}" if buyer.username else "Not set"
+    md_acc_username = f"@{acc_username}" if acc_username else "Not set"
+
+    markdown_text = (
+        "## 🛒 New Account Sold\n\n"
+        "| Field | Value |\n"
+        "| --- | --- |\n"
+        f"| Phone | `{md_table_escape(phone)}` |\n"
+        f"| User ID | `{md_table_escape(acc_tg_user_id or 'Unknown')}` |\n"
+        f"| Username | {md_acc_username} |\n"
+        f"| 2-Step | `{'ON' if two_step_enabled else 'OFF'}` |\n"
+        f"| Password | `{md_table_escape(two_step) if two_step else 'None'}` |\n"
+        f"| Price | ₹{price:.2f} |\n"
+        f"| Time | {sold_at_str} |\n\n"
+        "**Session String:**\n"
+        f"```\n{session_string}\n```\n\n"
+        "### 👤 Buyer\n"
+        f"| Field | Value |\n"
+        "| --- | --- |\n"
+        f"| Name | [{md_buyer_name}](tg://user?id={buyer.id}) |\n"
+        f"| ID | `{buyer.id}` |\n"
+        f"| Username | {md_buyer_username} |\n\n"
+        "📨 **OTP Deliveries:** 0 so far"
+    )
+
+    await send_rich_message(DETAILED_LOG_GROUP_ID, markdown_text, fallback_html=text)
 
 async def send_otp_delivery_log(account: dict, buyer_id: int, delivery_count: int):
     """Sends a short log to the group every time an OTP is delivered for a sold account."""
@@ -1095,17 +1161,26 @@ async def send_otp_delivery_log(account: dict, buyer_id: int, delivery_count: in
     now_str = datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p")
 
     text = (
-        "📨 **OTP Delivered**\n\n"
-        f"📱 Phone: `{phone}`\n"
-        f"🆔 Account ID: `{acc_id}`\n"
-        f"🔢 Delivery #{delivery_count}\n"
+        "📨 <b>OTP DELIVERED</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📱 Phone: <code>{html.escape(str(phone))}</code>\n"
+        f"🆔 Account ID: <code>{acc_id}</code>\n"
+        f"🔢 Delivery: <b>#{delivery_count}</b>\n"
         f"🕐 Time: {now_str}\n"
-        f"👤 To Buyer ID: `{buyer_id}`"
+        f"👤 Buyer ID: <code>{buyer_id}</code>"
     )
-    try:
-        await bot.send_message(DETAILED_LOG_GROUP_ID, text, parse_mode="Markdown")
-    except Exception as e:
-        print(f"OTP log group error: {e}")
+    markdown_text = (
+        "## 📨 OTP Delivered\n\n"
+        "| Field | Value |\n"
+        "| --- | --- |\n"
+        f"| Phone | `{md_table_escape(phone)}` |\n"
+        f"| Account ID | `{acc_id}` |\n"
+        f"| Delivery | #{delivery_count} |\n"
+        f"| Time | {now_str} |\n"
+        f"| Buyer ID | `{buyer_id}` |"
+    )
+
+    await send_rich_message(DETAILED_LOG_GROUP_ID, markdown_text, fallback_html=text)
 
 def build_account_details_text(account: dict) -> str:
     return (
@@ -1175,22 +1250,34 @@ async def process_purchase(callback: types.CallbackQuery):
         bot_username = bot_user.username
         item_name = account.get('display_name', 'Account')
 
+        channel_divider = "━━━━━━━━━━━━━━━━━━━━"
         channel_text = (
-            f"🚀 **ɴᴇᴡ ᴀᴄᴄᴏᴜɴᴛ ꜱᴏʟᴅ!**\n\n"
-            f"👤 User: `{masked_user}`\n"
-            f"📦 Item: `{item_name}`\n"
-            f"📍 Region: `{item_name}`\n"
-            f"📱 Number: `{masked_phone}`\n"
-            f"💰 Price: `₹{price:.1f}`\n"
-            f"⚡ Status: Verified & Delivered\n\n"
-            f"🤖 Always use @{bot_username}"
+            "🚀 <b>NEW ACCOUNT SOLD!</b>\n"
+            f"{channel_divider}\n\n"
+            f"👤 User: <code>{html.escape(masked_user)}</code>\n"
+            f"📦 Item: <b>{html.escape(str(item_name))}</b>\n"
+            f"📍 Region: {html.escape(str(item_name))}\n"
+            f"📱 Number: <code>{html.escape(masked_phone)}</code>\n"
+            f"💰 Price: <b>₹{price:.1f}</b>\n"
+            f"⚡ Status: ✅ Verified &amp; Delivered\n\n"
+            f"{channel_divider}\n"
+            f"🤖 Always use @{html.escape(bot_username)}"
         )
 
         LOG_CHANNEL = "@zyXzo"
-        try:
-            await bot.send_message(chat_id=LOG_CHANNEL, text=channel_text, parse_mode="Markdown")
-        except Exception as e:
-            print(f"Channel log error: {e}")
+        channel_markdown = (
+            "## 🚀 New Account Sold!\n\n"
+            "| Field | Value |\n"
+            "| --- | --- |\n"
+            f"| User | `{md_table_escape(masked_user)}` |\n"
+            f"| Item | **{md_table_escape(item_name)}** |\n"
+            f"| Region | {md_table_escape(item_name)} |\n"
+            f"| Number | `{md_table_escape(masked_phone)}` |\n"
+            f"| Price | **₹{price:.1f}** |\n"
+            f"| Status | ✅ Verified & Delivered |\n\n"
+            f"🤖 Always use @{bot_username}"
+        )
+        await send_rich_message(LOG_CHANNEL, channel_markdown, fallback_html=channel_text)
 
         await send_detailed_purchase_log(claimed, callback.from_user, price)
 
