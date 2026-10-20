@@ -5,6 +5,7 @@ import zipfile
 from datetime import datetime, timezone
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.crypto import AuthKey
 from telethon.tl.functions.account import GetPasswordRequest, GetAuthorizationsRequest, ResetAuthorizationRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -227,9 +228,35 @@ def _sqlite_session_kind(path: str) -> str:
     return "unknown"
 
 
+def _read_telethon_sqlite_raw(path: str):
+    """Reads dc_id, server_address, port, and auth_key straight out of a
+    Telethon .session sqlite file via raw SQL. This bypasses Telethon's own
+    SQLiteSession loader, which tries to run a schema version-upgrade on the
+    file and can crash with 'too many values to unpack' when the file was
+    saved by a different Telethon version than what's installed here. The
+    (dc_id, server_address, port, auth_key) columns are the one part of the
+    schema that's been stable across Telethon versions, so reading just
+    those directly is reliable regardless of which tool produced the file.
+    """
+    con = sqlite3.connect(path)
+    try:
+        row = con.execute("SELECT dc_id, server_address, port, auth_key FROM sessions LIMIT 1").fetchone()
+    finally:
+        con.close()
+    return row  # (dc_id, server_address, port, auth_key_bytes) or None
+
+
 async def _client_from_telethon_file(session_file_path: str):
-    session_name = session_file_path[:-8] if session_file_path.endswith(".session") else session_file_path
-    client = TelegramClient(session_name, API_ID, API_HASH)
+    raw = _read_telethon_sqlite_raw(session_file_path)
+    if not raw or not raw[3]:
+        raise RuntimeError("Could not read session data from this .session file (empty or unsupported schema).")
+
+    dc_id, server_address, port, auth_key_bytes = raw
+    session = StringSession()
+    session.set_dc(dc_id, server_address, port)
+    session.auth_key = AuthKey(data=auth_key_bytes)
+
+    client = TelegramClient(session, API_ID, API_HASH)
     await client.connect()
     return client
 
