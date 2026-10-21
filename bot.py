@@ -1566,7 +1566,21 @@ async def admin_panel(event: types.Message | types.CallbackQuery):
         [InlineKeyboardButton(text=sc("🔙 Main Menu"), callback_data="back_home")]
     ]
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    text = "⚙️ **ᴀᴅᴍɪɴ ᴄᴏɴᴛʀᴏʟ ᴘᴀɴᴇʟ**\n\nSelect an option below:"
+
+    try:
+        stats = await db.get_detailed_stock_stats()
+    except Exception:
+        stats = {"available": 0, "sold": 0, "users": 0, "revenue": 0}
+
+    text = (
+        sc("⚙️ admin control panel\n") +
+        "━━━━━━━━━━━━━━━━━━\n" +
+        sc(f"📦 stock      ·  {stats['available']} available  /  {stats['sold']} sold\n") +
+        sc(f"👥 users      ·  {stats['users']} registered\n") +
+        sc(f"💰 revenue    ·  ₹{stats['revenue']:.2f} total\n") +
+        "━━━━━━━━━━━━━━━━━━\n" +
+        sc("choose an option below 👇")
+    )
 
     if isinstance(event, types.CallbackQuery):
         await event.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
@@ -1578,26 +1592,41 @@ async def admin_stats_handler(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     stats = await db.get_detailed_stock_stats()
-    text = (
-        f"📊 **ᴅᴇᴛᴀɪʟᴇᴅ ᴀɴᴀʟʏᴛɪᴄꜱ & ꜱᴛᴏᴄᴋ ꜱᴛᴀᴛᴜꜱ:**\n\n"
-        f"• Available Accounts: `{stats['available']}`\n"
-        f"• Sold Accounts: `{stats['sold']}`\n"
-        f"• Total Registered Users: `{stats['users']}`\n"
-        f"• Total Revenue Generated: `₹{stats['revenue']:.2f}`\n"
-    )
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    md_table = (
+        "### 📊 Analytics & Stock Status\n\n"
+        "| Metric | Value |\n"
+        "|---|---|\n"
+        f"| Available Accounts | {stats['available']} |\n"
+        f"| Sold Accounts | {stats['sold']} |\n"
+        f"| Total Registered Users | {stats['users']} |\n"
+        f"| Total Revenue | ₹{stats['revenue']:.2f} |\n"
+    )
+    fallback_text = (
+        sc("📊 detailed analytics & stock status\n\n") +
+        sc(f"• available accounts : {stats['available']}\n") +
+        sc(f"• sold accounts      : {stats['sold']}\n") +
+        sc(f"• registered users   : {stats['users']}\n") +
+        sc(f"• total revenue      : ₹{stats['revenue']:.2f}\n")
+    )
+    await callback.message.delete()
+    await send_rich_message(callback.from_user.id, md_table, fallback_html=fallback_text)
+    await bot.send_message(callback.from_user.id, sc("🔙 back to admin panel"), reply_markup=markup)
 
 @dp.callback_query(F.data == "admin_supplier_menu")
 async def admin_supplier_menu(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     config = await db.get_supplier_config()
+    status_label = sc('active') if config['is_active'] else sc('inactive / modular placeholder')
+    url_label = config['api_url'] if config['api_url'] else sc('not set')
     text = (
-        f"🔗 **ꜱᴜᴘᴘʟɪᴇʀ ᴀᴘɪ ɪɴᴛᴇɢʀᴀᴛɪᴏɴ ꜱᴇᴛᴛɪɴɢꜱ**\n\n"
-        f"• Status: `{'Active' if config['is_active'] else 'Inactive / Modular Placeholder'}`\n"
-        f"• API URL: `{config['api_url'] if config['api_url'] else 'Not Set'}`\n\n"
-        f"Use this section to configure external supplier auto-refill hooks when needed."
+        sc("🔗 supplier api integration settings\n\n") +
+        sc("• status  : ") + f"`{status_label}`\n" +
+        sc("• api url : ") + f"`{url_label}`\n\n" +
+        sc("use this section to configure external supplier auto-refill hooks when needed.")
     )
     kb = [
         [InlineKeyboardButton(text=sc("✏️ Configure API URL & Key"), callback_data="config_supplier_step")],
@@ -1610,7 +1639,7 @@ async def config_supplier_step(callback: types.CallbackQuery, state: FSMContext)
     if not is_admin(callback.from_user.id):
         return
     await state.set_state(SupplierConfigState.waiting_for_url)
-    await callback.message.edit_text("🔗 Send Supplier API Endpoint URL:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_supplier_menu")]]))
+    await callback.message.edit_text(sc("🔗 send supplier api endpoint url:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_supplier_menu")]]))
 
 @dp.message(SupplierConfigState.waiting_for_url)
 async def supplier_get_url(message: types.Message, state: FSMContext):
@@ -1618,7 +1647,7 @@ async def supplier_get_url(message: types.Message, state: FSMContext):
         return
     await state.update_data(supplier_url=message.text.strip())
     await state.set_state(SupplierConfigState.waiting_for_key)
-    await message.answer("🔑 Send Supplier API Key / Token:")
+    await message.answer(sc("🔑 send supplier api key / token:"))
 
 @dp.message(SupplierConfigState.waiting_for_key)
 async def supplier_get_key(message: types.Message, state: FSMContext):
@@ -1630,7 +1659,7 @@ async def supplier_get_key(message: types.Message, state: FSMContext):
     await db.set_supplier_config(url, key, is_active=True)
     await state.clear()
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
-    await message.answer("✅ Supplier API configuration saved successfully!", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.answer(sc("✅ supplier api configuration saved successfully!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data == "admin_health_check")
 async def admin_health_check(callback: types.CallbackQuery):
@@ -1639,9 +1668,9 @@ async def admin_health_check(callback: types.CallbackQuery):
     accounts = await db.get_all_unsold_accounts()
     total_unsold = len(accounts)
     text = (
-        f"🩺 **ᴀᴄᴄᴏᴜɴᴛ ʜᴇᴀʟᴛʜ ᴄʜᴇᴄᴋ ʀᴇᴘᴏʀᴛ**\n\n"
-        f"• Total Unsold Accounts in Stock: `{total_unsold}`\n"
-        f"• Session Validation Status: All sessions are registered in DB.\n"
+        sc("🩺 account health check report\n\n") +
+        sc(f"• total unsold accounts in stock : `{total_unsold}`\n") +
+        sc("• session validation status       : all sessions are registered in db.\n")
     )
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
@@ -1654,7 +1683,7 @@ async def admin_info_categories(callback: types.CallbackQuery):
     kb = [[InlineKeyboardButton(text=sc(name), callback_data=f"admininfotier_{tid}")] for tid, name in tiers]
     kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
     await callback.message.edit_text(
-        sc("ℹ️ **Select a type:**"),
+        sc("ℹ️ select a type:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         parse_mode="Markdown"
     )
@@ -1670,7 +1699,7 @@ async def admin_info_tier_categories(callback: types.CallbackQuery):
     categories = await db.get_categories_with_counts(tier_id)
     if not categories:
         await callback.message.edit_text(
-            f"❌ No categories available in {label}.",
+            sc(f"❌ no categories available in {label}."),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_info")]])
         )
         return
@@ -1678,7 +1707,7 @@ async def admin_info_tier_categories(callback: types.CallbackQuery):
     kb = [[InlineKeyboardButton(text=sc(f"📂 {name}"), callback_data=f"infostat_{cid}")] for cid, name, _count in categories]
     kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_info")])
     await callback.message.edit_text(
-        sc(f"ℹ️ **{label} — Select a category to view account info:**"),
+        sc(f"ℹ️ {label} — select a category to view account info:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         parse_mode="Markdown"
     )
@@ -1696,7 +1725,7 @@ async def admin_info_status_menu(callback: types.CallbackQuery):
     accounts = await db.get_accounts_by_category_full(cat_id)
     if not accounts:
         await callback.message.edit_text(
-            "❌ No accounts in this category.",
+            sc("❌ no accounts in this category."),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data=back_target)]])
         )
         return
@@ -1710,7 +1739,7 @@ async def admin_info_status_menu(callback: types.CallbackQuery):
         [InlineKeyboardButton(text=sc("🔙 Back"), callback_data=back_target)]
     ]
     await callback.message.edit_text(
-        sc("ℹ️ **Choose which accounts to view:**"),
+        sc("ℹ️ choose which accounts to view:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         parse_mode="Markdown"
     )
@@ -1736,7 +1765,7 @@ async def admin_info_accounts(callback: types.CallbackQuery):
 
     if not accounts:
         await callback.message.edit_text(
-            f"❌ No {label} accounts in this category.",
+            sc(f"❌ no {label.split(' ', 1)[-1].lower()} accounts in this category."),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"infostat_{cat_id}")]])
         )
         return
@@ -1746,16 +1775,17 @@ async def admin_info_accounts(callback: types.CallbackQuery):
     start = page * ADMIN_INFO_PAGE_SIZE
     page_items = accounts[start:start + ADMIN_INFO_PAGE_SIZE]
 
-    lines = [sc(f"ℹ️ **{label} Accounts (Page {page + 1}/{total_pages})**\n")]
+    lines = [sc(f"ℹ️ {label} accounts (page {page + 1}/{total_pages})\n")]
     for idx, acc in enumerate(page_items, start=1):
-        sold_to = f"\n   👤 Buyer ID: `{acc.get('sold_to')}`" if status == "sold" and acc.get("sold_to") else ""
+        sold_to = sc(f"\n   👤 buyer id: ") + f"`{acc.get('sold_to')}`" if status == "sold" and acc.get("sold_to") else ""
+        two_step_label = sc("on") if acc.get("two_step_enabled") else sc("off")
         lines.append(
-            f"**{start + idx}. {acc.get('display_name', 'Account')}**\n"
-            f"   🆔 Acc ID: `{acc['account_id']}`\n"
-            f"   📱 Phone: `{acc.get('phone_number', 'Unknown')}`\n"
-            f"   🆔 TG User ID: `{acc.get('telegram_user_id') or 'Unknown'}`\n"
-            f"   💰 Price: ₹{acc.get('price')}\n"
-            f"   🔐 2-Step: {'ON' if acc.get('two_step_enabled') else 'OFF'}{sold_to}\n"
+            sc(f"{start + idx}. {acc.get('display_name', 'Account')}\n") +
+            sc(f"   🆔 acc id       : ") + f"`{acc['account_id']}`\n" +
+            sc(f"   📱 phone        : ") + f"`{acc.get('phone_number', 'Unknown')}`\n" +
+            sc(f"   🆔 tg user id   : ") + f"`{acc.get('telegram_user_id') or 'Unknown'}`\n" +
+            sc(f"   💰 price        : ") + f"₹{acc.get('price')}\n" +
+            sc(f"   🔐 2-step       : ") + f"{two_step_label}{sold_to}\n"
         )
 
     nav_row = []
@@ -1784,7 +1814,7 @@ async def admin_cats_handler(callback: types.CallbackQuery):
     kb.append([InlineKeyboardButton(text=sc("➕ Add New Type"), callback_data="admin_add_tier")])
     kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
     await callback.message.edit_text(
-        sc("📂 **Manage Categories:**\n\nSelect a type:"),
+        sc("📂 manage categories\n\nselect a type:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         parse_mode="Markdown"
     )
@@ -1795,7 +1825,7 @@ async def admin_add_tier_prompt(callback: types.CallbackQuery, state: FSMContext
         return
     await state.set_state(AddTierState.waiting_for_name)
     await callback.message.edit_text(
-        "✍️ Send the name of the new type (e.g., Premium, VIP):",
+        sc("✍️ send the name of the new type (e.g., premium, vip):"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_cats")]])
     )
 
@@ -1805,12 +1835,12 @@ async def save_tier(message: types.Message, state: FSMContext):
         return
     name = (message.text or "").strip()
     if not name:
-        await message.answer("❌ Please send a valid name:")
+        await message.answer(sc("❌ please send a valid name:"))
         return
     await db.add_tier(name)
     await state.clear()
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_cats")]]
-    await message.answer(f"✅ Type '{name}' added successfully!", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.answer(sc(f"✅ type '{name}' added successfully!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("admincattier_"))
 async def admin_cats_by_tier(callback: types.CallbackQuery):
@@ -1826,7 +1856,7 @@ async def admin_cats_by_tier(callback: types.CallbackQuery):
     kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_cats")])
 
     await callback.message.edit_text(
-        sc(f"📂 **{label} Categories:**\n\nClick a category to edit its name:"),
+        sc(f"📂 {label} categories\n\nclick a category to edit its name:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         parse_mode="Markdown"
     )
@@ -1842,7 +1872,7 @@ async def edit_category_start(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(editing_cat_id=cat_id, editing_cat_tier=tier_id)
     await state.set_state(EditCategoryState.waiting_for_new_name)
     await callback.message.edit_text(
-        "✍ Send new category name:",
+        sc("✍ send new category name:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data=f"admincattier_{tier_id}")]])
     )
 
@@ -1858,27 +1888,38 @@ async def save_edited_category(message: types.Message, state: FSMContext):
     await db.update_category_name(cat_id, new_name)
     await state.clear()
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"admincattier_{tier_id}")]]
-    await message.answer(f"✅ Category successfully renamed to '{new_name}'!", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.answer(sc(f"✅ category successfully renamed to '{new_name}'!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data == "admin_users")
 async def admin_users_handler(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     stats = await db.get_user_management_stats()
-
-    text = (
-        sc("👥 **User Management**") + "\n\n"
-        f"👤 Total Users: **{stats['total']}**\n"
-        f"✅ Verified: **{stats['verified']}**\n"
-        f"🚫 Banned: **{stats['banned']}**"
-    )
     kb = [
         [InlineKeyboardButton(text=sc("🚫 Ban a User"), callback_data="admin_ban_user")],
         [InlineKeyboardButton(text=sc("✅ Unban a User"), callback_data="admin_unban_user")],
         [InlineKeyboardButton(text=sc("📋 View Banned Users"), callback_data="admin_banned_list_0")],
         [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]
     ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    md_table = (
+        "### 👥 User Management\n\n"
+        "| Metric | Count |\n"
+        "|---|---|\n"
+        f"| Total Users | {stats['total']} |\n"
+        f"| Verified | {stats['verified']} |\n"
+        f"| Banned | {stats['banned']} |\n"
+    )
+    fallback_text = (
+        sc("👥 user management\n\n") +
+        sc(f"• total users : {stats['total']}\n") +
+        sc(f"• verified    : {stats['verified']}\n") +
+        sc(f"• banned      : {stats['banned']}\n")
+    )
+    await callback.message.delete()
+    await send_rich_message(callback.from_user.id, md_table, fallback_html=fallback_text)
+    await bot.send_message(callback.from_user.id, sc("👇 choose an action"), reply_markup=markup)
 
 ADMIN_BANNED_PAGE_SIZE = 10
 
@@ -1892,7 +1933,7 @@ async def admin_banned_list(callback: types.CallbackQuery):
 
     if total_banned == 0:
         await callback.message.edit_text(
-            sc("📋 **Banned Users**") + "\n\nNo banned users right now.",
+            sc("📋 banned users\n\nno banned users right now."),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_users")]]),
             parse_mode="Markdown"
         )
@@ -1902,8 +1943,8 @@ async def admin_banned_list(callback: types.CallbackQuery):
     page = max(0, min(page, total_pages - 1))
     banned_ids = await db.get_banned_users(limit=ADMIN_BANNED_PAGE_SIZE, skip=page * ADMIN_BANNED_PAGE_SIZE)
 
-    lines = [sc(f"📋 **Banned Users (Page {page + 1}/{total_pages})**"), ""]
-    lines += [f"{page * ADMIN_BANNED_PAGE_SIZE + i}. `{uid}`" for i, uid in enumerate(banned_ids, start=1)]
+    lines = [sc(f"📋 banned users (page {page + 1}/{total_pages})"), ""]
+    lines += [sc(f"{page * ADMIN_BANNED_PAGE_SIZE + i}. ") + f"`{uid}`" for i, uid in enumerate(banned_ids, start=1)]
 
     nav_row = []
     if page > 0:
@@ -1924,7 +1965,7 @@ async def admin_ban_user_prompt(callback: types.CallbackQuery, state: FSMContext
         return
     await state.set_state(BanUserState.waiting_for_user_id)
     await state.update_data(ban_action=1)
-    await callback.message.edit_text("✍️ Send the **User ID** of the user you want to ban:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_users")]]), parse_mode="Markdown")
+    await callback.message.edit_text(sc("✍️ send the user id of the user you want to ban:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_users")]]), parse_mode="Markdown")
 
 # NOTE: the original code had no handler for admin_unban_user; added here.
 @dp.callback_query(F.data == "admin_unban_user")
@@ -1933,7 +1974,7 @@ async def admin_unban_user_prompt(callback: types.CallbackQuery, state: FSMConte
         return
     await state.set_state(BanUserState.waiting_for_user_id)
     await state.update_data(ban_action=0)
-    await callback.message.edit_text("✍️ Send the **User ID** of the user you want to unban:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_users")]]), parse_mode="Markdown")
+    await callback.message.edit_text(sc("✍️ send the user id of the user you want to unban:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_users")]]), parse_mode="Markdown")
 
 @dp.message(BanUserState.waiting_for_user_id)
 async def execute_ban_user(message: types.Message, state: FSMContext):
@@ -1942,7 +1983,7 @@ async def execute_ban_user(message: types.Message, state: FSMContext):
     try:
         target_id = int(message.text)
     except (ValueError, TypeError):
-        await message.answer("❌ Invalid User ID. Please send numbers only.")
+        await message.answer(sc("❌ invalid user id. please send numbers only."))
         return
 
     data = await state.get_data()
@@ -1951,37 +1992,54 @@ async def execute_ban_user(message: types.Message, state: FSMContext):
     await state.clear()
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_users")]]
     if action == 1:
-        await message.answer(f"✅ User `{target_id}` has been successfully banned!", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await message.answer(sc("✅ user ") + f"`{target_id}`" + sc(" has been successfully banned!"), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     else:
-        await message.answer(f"✅ User `{target_id}` has been unbanned!", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await message.answer(sc("✅ user ") + f"`{target_id}`" + sc(" has been unbanned!"), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data == "admin_sales_history")
 async def admin_sales_history(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     sales = await db.get_all_sales_history(limit=15)
-
-    lines = [sc("📦 **Recent Sales:**"), ""]
-    if not sales:
-        lines.append("No sales records found yet.")
-    else:
-        total = sum(s.get("amount", 0) for s in sales)
-        for idx, s in enumerate(sales, start=1):
-            ts = s.get("timestamp")
-            date_str = ts.strftime("%d %b, %I:%M %p") if ts else "Unknown"
-            lines.append(f"{idx}. ₹{s['amount']:.2f} — user `{s['user_id']}`\n    🕐 {date_str}")
-        lines.append("")
-        lines.append(f"**Total (last {len(sales)}):** ₹{total:.2f}")
-
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
-    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    if not sales:
+        await callback.message.edit_text(
+            sc("📦 recent sales\n\nno sales records found yet."),
+            reply_markup=markup, parse_mode="Markdown"
+        )
+        return
+
+    total = sum(s.get("amount", 0) for s in sales)
+    md_rows = []
+    fallback_lines = [sc("📦 recent sales\n")]
+    for idx, s in enumerate(sales, start=1):
+        ts = s.get("timestamp")
+        date_str = ts.strftime("%d %b, %I:%M %p") if ts else "Unknown"
+        md_rows.append(f"| {idx} | ₹{s['amount']:.2f} | `{s['user_id']}` | {date_str} |")
+        fallback_lines.append(sc(f"{idx}. ₹{s['amount']:.2f} — user ") + f"`{s['user_id']}`" + sc(f" 🕐 {date_str}"))
+
+    md_table = (
+        "### 📦 Recent Sales\n\n"
+        "| # | Amount | User | Time |\n"
+        "|---|---|---|---|\n" +
+        "\n".join(md_rows) +
+        f"\n\n**Total (last {len(sales)}):** ₹{total:.2f}"
+    )
+    fallback_lines.append(sc(f"\ntotal (last {len(sales)}) : ₹{total:.2f}"))
+    fallback_text = "\n".join(fallback_lines)
+
+    await callback.message.delete()
+    await send_rich_message(callback.from_user.id, md_table, fallback_html=fallback_text)
+    await bot.send_message(callback.from_user.id, sc("🔙 back to admin panel"), reply_markup=markup)
 
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_prompt(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     await state.set_state(BroadcastState.waiting_for_message)
-    await callback.message.edit_text("📢 Send the message/text/photo to broadcast to all users:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_panel")]]))
+    await callback.message.edit_text(sc("📢 send the message/text/photo to broadcast to all users:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_panel")]]))
 
 @dp.message(BroadcastState.waiting_for_message)
 async def execute_broadcast(message: types.Message, state: FSMContext):
@@ -1992,7 +2050,7 @@ async def execute_broadcast(message: types.Message, state: FSMContext):
     sent = 0
     failed = 0
 
-    status_msg = await message.answer("📢 Broadcast started...")
+    status_msg = await message.answer(sc("📢 broadcast started..."))
     for uid in users:
         try:
             await message.send_copy(chat_id=uid)
@@ -2001,7 +2059,10 @@ async def execute_broadcast(message: types.Message, state: FSMContext):
         except Exception:
             failed += 1
 
-    await status_msg.edit_text(f"✅ **Broadcast Completed!**\n\n- Sent: {sent}\n- Failed: {failed}", parse_mode="Markdown")
+    await status_msg.edit_text(
+        sc("✅ broadcast completed!\n\n") + sc(f"- sent   : {sent}\n") + sc(f"- failed : {failed}"),
+        parse_mode="Markdown"
+    )
 
 @dp.callback_query(F.data == "admin_del_acc_list")
 async def admin_del_acc_list(callback: types.CallbackQuery):
@@ -2010,7 +2071,7 @@ async def admin_del_acc_list(callback: types.CallbackQuery):
     accounts = await db.get_all_unsold_accounts()
     if not accounts:
         await callback.message.edit_text(
-            "❌ No accounts available to delete.",
+            sc("❌ no accounts available to delete."),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]])
         )
         return
@@ -2018,7 +2079,7 @@ async def admin_del_acc_list(callback: types.CallbackQuery):
     kb = [[InlineKeyboardButton(text=sc(f"❌ Delete {disp_name} (₹{price})"), callback_data=f"delacc_{acc_id}")] for acc_id, disp_name, price in accounts]
     kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
 
-    await callback.message.edit_text("🗑️ **Delete Account:**\n\nClick an account to delete it:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await callback.message.edit_text(sc("🗑️ delete account\n\nclick an account to delete it:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("delacc_"))
 async def delete_account_action(callback: types.CallbackQuery):
@@ -2026,7 +2087,7 @@ async def delete_account_action(callback: types.CallbackQuery):
         return
     acc_id = int(callback.data.split("_")[1])
     await db.delete_account(acc_id)
-    await callback.answer("✅ Account successfully deleted!", show_alert=True)
+    await callback.answer(sc("✅ account successfully deleted!"), show_alert=True)
     await admin_del_acc_list(callback)
 
 @dp.callback_query(F.data.startswith("admin_add_cat_"))
@@ -2040,7 +2101,7 @@ async def admin_add_cat(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(new_cat_tier=tier_id)
     await state.set_state(AddCategoryState.waiting_for_name)
     await callback.message.edit_text(
-        f"✍️ Send the country name to add under {label}:",
+        sc(f"✍️ send the country name to add under {label}:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_panel")]])
     )
 
@@ -2060,7 +2121,7 @@ async def save_cat(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"admincattier_{tier_id}")]
     ]
     await message.answer(
-        f"✅ Category '{message.text}' added successfully under {label}!",
+        sc(f"✅ category '{message.text}' added successfully under {label}!"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
     )
 
@@ -2076,7 +2137,7 @@ async def admin_add_acc(event: types.Message | types.CallbackQuery, state: FSMCo
     kb = [[InlineKeyboardButton(text=sc(name), callback_data=f"addacctier_{tid}")] for tid, name in tiers]
     kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    text = sc("➕ **Add Account**\n\nSelect a type:")
+    text = sc("➕ add account\n\nselect a type:")
 
     if isinstance(event, types.CallbackQuery):
         await event.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
@@ -2098,7 +2159,7 @@ async def admin_add_acc_pick_category(callback: types.CallbackQuery, state: FSMC
     kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_add_acc")])
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
 
-    await callback.message.edit_text(sc(f"📂 {label} — Select a country:"), reply_markup=markup, parse_mode="Markdown")
+    await callback.message.edit_text(sc(f"📂 {label} — select a country:"), reply_markup=markup, parse_mode="Markdown")
     await callback.answer()
 
 def admin_cancel_kb():
@@ -2116,7 +2177,7 @@ async def sel_cat(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(category_id=int(callback.data.split("_")[1]))
     await state.set_state(AddItemState.waiting_for_display_name)
     await callback.message.edit_text(
-        "✍️ Send display name for button (e.g., 🇮🇳 India - ₹25):",
+        sc("✍️ send display name for button (e.g., 🇮🇳 india - ₹25):"),
         reply_markup=admin_cancel_kb()
     )
 
@@ -2126,7 +2187,7 @@ async def get_display_name(message: types.Message, state: FSMContext):
         return
     await state.update_data(display_name=message.text)
     await state.set_state(AddItemState.waiting_for_price)
-    await message.answer("💵 Send price in ₹ (e.g., 20.0):", reply_markup=admin_cancel_kb())
+    await message.answer(sc("💵 send price in ₹ (e.g., 20.0):"), reply_markup=admin_cancel_kb())
 
 @dp.message(AddItemState.waiting_for_price)
 async def get_price(message: types.Message, state: FSMContext):
@@ -2135,24 +2196,24 @@ async def get_price(message: types.Message, state: FSMContext):
     try:
         price = float(message.text)
     except ValueError:
-        await message.answer("❌ Invalid price. Enter a valid number:", reply_markup=admin_cancel_kb())
+        await message.answer(sc("❌ invalid price. enter a valid number:"), reply_markup=admin_cancel_kb())
         return
 
     if price <= 0:
-        await message.answer("❌ Price must be greater than ₹0. Enter a valid price:", reply_markup=admin_cancel_kb())
+        await message.answer(sc("❌ price must be greater than ₹0. enter a valid price:"), reply_markup=admin_cancel_kb())
         return
     if price > 100000:
-        await message.answer("❌ Price seems too high. Enter a valid price:", reply_markup=admin_cancel_kb())
+        await message.answer(sc("❌ price seems too high. enter a valid price:"), reply_markup=admin_cancel_kb())
         return
 
     await state.update_data(price=price)
     await state.set_state(AddItemState.waiting_for_session)
     await message.answer(
-        "🔑 Send the account session. Any of these work:\n"
-        "• A Telethon session string (as text)\n"
-        "• A Pyrogram session string (as text)\n"
-        "• A Telethon or Pyrogram `.session` file\n"
-        "• A `.zip` file containing a `.session` file or a tdata folder",
+        sc("🔑 send the account session. any of these work:\n") +
+        sc("• a telethon session string (as text)\n") +
+        sc("• a pyrogram session string (as text)\n") +
+        sc("• a telethon or pyrogram ") + "`.session`" + sc(" file\n") +
+        sc("• a ") + "`.zip`" + sc(" file containing a ") + "`.session`" + sc(" file or a tdata folder"),
         parse_mode="Markdown",
         reply_markup=admin_cancel_kb()
     )
@@ -2162,7 +2223,7 @@ async def get_session(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
 
-    checking_msg = await message.answer("🔍 Reading session, please wait...")
+    checking_msg = await message.answer(sc("🔍 reading session, please wait..."))
     work_dir = tempfile.mkdtemp(prefix="sess_")
     info, error = None, None
 
@@ -2194,9 +2255,9 @@ async def get_session(message: types.Message, state: FSMContext):
 
     if error or not info:
         await checking_msg.edit_text(
-            f"❌ Session invalid. Account cannot be added.\n\n"
-            f"Reason: {error}\n\n"
-            f"Please send a valid session (string, .session file, or .zip):",
+            sc("❌ session invalid. account cannot be added.\n\n") +
+            sc("reason: ") + f"{error}" + "\n\n" +
+            sc("please send a valid session (string, .session file, or .zip):"),
             reply_markup=admin_cancel_kb()
         )
         return
@@ -2208,14 +2269,14 @@ async def get_session(message: types.Message, state: FSMContext):
         two_step_enabled=info["two_step_enabled"],
     )
 
-    status_line = "ON" if info["two_step_enabled"] else "OFF"
+    status_line = sc("on") if info["two_step_enabled"] else sc("off")
     await state.set_state(AddItemState.waiting_for_two_step)
     await checking_msg.edit_text(
-        f"✅ Session verified!\n\n"
-        f"📱 Phone: `{info['phone_number']}`\n"
-        f"🆔 User ID: `{info['user_id']}`\n"
-        f"🔐 2-Step Verification (detected): **{status_line}**\n\n"
-        f"Please send the 2-Step password for this account (or send `skip` if you don't have one):",
+        sc("✅ session verified!\n\n") +
+        sc("📱 phone   : ") + f"`{info['phone_number']}`\n" +
+        sc("🆔 user id : ") + f"`{info['user_id']}`\n" +
+        sc("🔐 2-step verification (detected) : ") + f"**{status_line}**\n\n" +
+        sc("please send the 2-step password for this account (or send ") + "`skip`" + sc(" if you don't have one):"),
         parse_mode="Markdown",
         reply_markup=admin_cancel_kb()
     )
@@ -2244,14 +2305,14 @@ async def finalize_add_account(message: types.Message, state: FSMContext):
         )
     except ValueError as e:
         await state.clear()
-        await message.answer(f"❌ Could not add account: {e}")
+        await message.answer(sc("❌ could not add account: ") + f"{e}")
         return
     await state.clear()
     kb = [
         [InlineKeyboardButton(text=sc("➕ Add Another"), callback_data="admin_add_acc")],
         [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]
     ]
-    await message.answer("✅ Account added successfully!", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.answer(sc("✅ account added successfully!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 JOIN_DELAY_MIN = 3   # seconds between each account's join attempt
 JOIN_DELAY_MAX = 7
