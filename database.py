@@ -77,6 +77,7 @@ async def get_user(user_id: int):
                     "referred_by": None,
                     "referral_count": 0,
                     "referral_rewarded": 0,
+                    "onboarded": 0,
                 }
             },
             upsert=True,
@@ -84,6 +85,14 @@ async def get_user(user_id: int):
         )
     except DuplicateKeyError:
         return await users_col.find_one({"user_id": user_id})
+
+
+async def mark_onboarded(user_id: int):
+    await users_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"onboarded": 1}},
+        upsert=True,
+    )
 
 
 async def update_verification(user_id: int, status: int):
