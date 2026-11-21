@@ -2,10 +2,10 @@ from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
-from config import MONGO_URI
+from config import MONGO_URI, DATABASE_NAME
 
 client = AsyncIOMotorClient(MONGO_URI)
-db = client["telegram_otp_bot"]
+db = client[DATABASE_NAME]
 
 tiers_col = db["tiers"]
 categories_col = db["categories"]

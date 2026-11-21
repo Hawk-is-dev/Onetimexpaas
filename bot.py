@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, LabeledPrice, PreCheckoutQuery, Message
 
-from config import BOT_TOKEN, OWNER_ID, REQUIRED_CHANNELS
+from config import BOT_TOKEN, OWNER_ID, REQUIRED_CHANNELS, ADMIN_LOG_GROUP_ID
 import database as db
 from userbot import start_userbot_for_account, active_clients, extract_account_info, get_devices, terminate_device, process_uploaded_session, terminate_bot_session, join_channel_with_session, logout_session, touch, cleanup_idle_clients
 
@@ -27,7 +27,7 @@ dp = Dispatcher()
 CO_OWNER_ID = 0
 
 STAR_RATE = 1.3
-DETAILED_LOG_GROUP_ID = -1003967024567
+DETAILED_LOG_GROUP_ID = ADMIN_LOG_GROUP_ID  # from env; None = detailed logs skipped
 
 DEPOSIT_MIN_AMOUNT = 30
 UPI_ID = "yourupi@okbank"          # TODO: replace with your real UPI ID
@@ -55,7 +55,7 @@ def stars_bonus_percent(stars_count: int) -> int:
     return 0
 
 
-PRIVACY_POLICY_TEXT = """📜 Privacy Policy & Terms – Tg Otp Store Bot
+PRIVACY_POLICY_TEXT = """📜 Privacy Policy & Terms – ZEROX OTP BOT
 
 Last updated: October 2026
 
@@ -94,7 +94,7 @@ By using this bot and making a purchase, you confirm that you have read and agre
 You can stop using the bot at any time. To request deletion of your data, contact us.
 
 8. Contact
-Telegram: @izoph"""
+Telegram: @Meto_bacchi_hu"""
 
 _SMALL_CAPS_MAP = {
     'a': 'ᴀ', 'b': 'ʙ', 'c': 'ᴄ', 'd': 'ᴅ', 'e': 'ᴇ', 'f': 'ꜰ', 'g': 'ɢ', 'h': 'ʜ', 'i': 'ɪ',
@@ -223,10 +223,11 @@ async def check_user_channels(user_id: int) -> bool:
     # Run all channel-membership checks concurrently instead of one-by-one —
     # this was the main cause of /start feeling slow (each sequential Telegram
     # API call adds ~200-400ms; with several channels that stacks up to 1-2+ sec).
-    results = await asyncio.gather(*(_is_member(ch) for ch in REQUIRED_CHANNELS))
+    to_check = [ch["chat"] for ch in REQUIRED_CHANNELS if ch.get("chat") is not None]
+    results = await asyncio.gather(*(_is_member(ch) for ch in to_check))
     return all(results)
 
-BOT_DISPLAY_NAME = "Tg Otp Store Bot"
+BOT_DISPLAY_NAME = "ZEROX OTP BOT"
 
 async def send_main_menu(message_or_callback, note: str = "", user_data: dict = None):
     user_id = message_or_callback.from_user.id
@@ -318,7 +319,7 @@ async def cmd_start(message: types.Message):
 
     kb = []
     for idx, ch in enumerate(REQUIRED_CHANNELS, start=1):
-        kb.append([InlineKeyboardButton(text=sc(f"📢 Join Channel {idx}"), url=f"https://t.me/{ch.lstrip('@')}")])
+        kb.append([InlineKeyboardButton(text=sc(f"📢 Join Channel {idx}"), url=ch["link"])])
     kb.append([InlineKeyboardButton(text=sc("✅ Verify Membership"), callback_data="verify_membership")])
 
     await message.answer(
@@ -1299,7 +1300,11 @@ async def cmd_checkchannels(message: types.Message):
         return
 
     lines = [f"🔍 **Channel diagnostic for user `{target_id}`:**\n"]
-    for ch in REQUIRED_CHANNELS:
+    for entry in REQUIRED_CHANNELS:
+        ch = entry.get("chat")
+        if ch is None:
+            lines.append(f"📢 Channel: `{entry['link']}`\n   ⚠️ Numeric ID not set (FORCE_JOIN_PRIVATE_ID) — membership is NOT being checked for this one.\n")
+            continue
         block = f"📢 Channel: `{ch}`\n"
         try:
             bot_member = await bot.get_chat_member(chat_id=ch, user_id=bot.id)
@@ -1323,6 +1328,9 @@ async def cmd_checkchannels(message: types.Message):
 async def send_detailed_purchase_log(account: dict, buyer: types.User, price: float):
     """Sends a full-detail log of the sale to the private admin group (DETAILED_LOG_GROUP_ID).
     Separate from the public LOG_CHANNEL notification, which stays as-is."""
+    if not DETAILED_LOG_GROUP_ID:
+        print("ADMIN_LOG_GROUP_ID not set - detailed sale log skipped")
+        return
     phone = account.get("phone_number", "Unknown")
     acc_tg_user_id = account.get("telegram_user_id")
     acc_username = account.get("telegram_username")
@@ -1392,6 +1400,8 @@ async def send_detailed_purchase_log(account: dict, buyer: types.User, price: fl
 
 async def send_otp_delivery_log(account: dict, buyer_id: int, delivery_count: int):
     """Sends a short log to the group every time an OTP is delivered for a sold account."""
+    if not DETAILED_LOG_GROUP_ID:
+        return
     phone = account.get("phone_number", "Unknown")
     acc_id = account.get("account_id")
     now_str = datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p")
@@ -1569,7 +1579,7 @@ async def process_purchase(callback: types.CallbackQuery):
             f"🤖 Always use @{html.escape(bot_username)}"
         )
 
-        LOG_CHANNEL = "@zyXzo"
+        LOG_CHANNEL = "@Logs_4888"
         channel_markdown = (
             "## 🚀 New Account Sold!\n\n"
             "| Field | Value |\n"
@@ -1815,8 +1825,9 @@ async def privacy_policy_handler(event: types.Message | types.CallbackQuery):
 @dp.callback_query(F.data == "support")
 async def support_handler(callback: types.CallbackQuery):
     kb = [
-        [InlineKeyboardButton(text=sc("👤 Owner"), url="https://t.me/izoph")],
-        [InlineKeyboardButton(text=sc("👥 Support Group"), url="https://t.me/genzportals")],
+        [InlineKeyboardButton(text=sc("👤 Owner"), url="https://t.me/Meto_bacchi_hu")],
+        [InlineKeyboardButton(text="💬 @Meto_bacchi_hu", url="https://t.me/Meto_bacchi_hu")],
+        [InlineKeyboardButton(text=sc("👥 Support Group"), url="https://t.me/+Gw6-s632_fI5NTQ1")],
         [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")]
     ]
     await callback.message.edit_text(
@@ -2799,4 +2810,10 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    # Render free web service needs an open $PORT + keep-awake pings.
+    try:
+        from keepalive import keep_alive
+        keep_alive()
+    except Exception as e:
+        print(f"keepalive not started: {e}")
     asyncio.run(main())
