@@ -3,21 +3,34 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", 0))
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH")
-MONGO_URI = os.getenv("MONGO_URI")
-# Separate database name inside the same Mongo cluster, so this bot never
-# touches another bot's data. Change only if you want a different name.
-DATABASE_NAME = os.getenv("DATABASE_NAME", "zerox_otp_bot")
-UPI_ID = os.getenv("UPI_ID", "Not Set")
-CRYPTO_ADDRESS = os.getenv("CRYPTO_ADDRESS", "Not Set")
+def _clean(name: str, default: str = "") -> str:
+    """Env value without stray spaces or quotes (Render/Railway dashboards keep
+    quotes literally, so OWNER_ID="123" would otherwise break int())."""
+    val = os.getenv(name)
+    if val is None:
+        return default
+    val = val.strip().strip('"').strip("'").strip()
+    return val if val else default
+
 
 def _int_env(name: str):
-    """Numeric chat ID from env (e.g. -1001234567890). None if not set."""
-    val = (os.getenv(name) or "").strip()
+    """Numeric ID from env (e.g. -1001234567890). None if not set / not a number."""
+    val = _clean(name)
     return int(val) if val.lstrip("-").isdigit() else None
+
+
+BOT_TOKEN = _clean("BOT_TOKEN")
+OWNER_ID = _int_env("OWNER_ID") or 0
+# Second admin (optional) — gets the same admin commands as the owner. 0 = none.
+CO_OWNER_ID = _int_env("CO_OWNER_ID") or 0
+API_ID = _int_env("API_ID") or 0
+API_HASH = _clean("API_HASH") or None
+MONGO_URI = _clean("MONGO_URI")
+# Separate database name inside the same Mongo cluster, so this bot never
+# touches another bot's data. Change only if you want a different name.
+DATABASE_NAME = _clean("DATABASE_NAME", "zerox_otp_bot")
+UPI_ID = _clean("UPI_ID", "Not Set")
+CRYPTO_ADDRESS = _clean("CRYPTO_ADDRESS", "Not Set")  # crypto deposit is still "unavailable" in the bot
 
 
 # Force-join channels shown in /start. Only these — the private admin log

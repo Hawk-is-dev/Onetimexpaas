@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, LabeledPrice, PreCheckoutQuery, Message
 
-from config import BOT_TOKEN, OWNER_ID, REQUIRED_CHANNELS, ADMIN_LOG_GROUP_ID
+from config import BOT_TOKEN, OWNER_ID, CO_OWNER_ID, UPI_ID, REQUIRED_CHANNELS, ADMIN_LOG_GROUP_ID
 import database as db
 from userbot import start_userbot_for_account, active_clients, extract_account_info, get_devices, terminate_device, process_uploaded_session, terminate_bot_session, join_channel_with_session, logout_session, touch, cleanup_idle_clients
 
@@ -24,13 +24,10 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-CO_OWNER_ID = 0
-
 STAR_RATE = 1.3
 DETAILED_LOG_GROUP_ID = ADMIN_LOG_GROUP_ID  # from env; None = detailed logs skipped
 
 DEPOSIT_MIN_AMOUNT = 30
-UPI_ID = "yourupi@okbank"          # TODO: replace with your real UPI ID
 UPI_QR_IMAGE_PATH = "upi_qr.jpg"   # TODO: put your QR code image file at this path (same folder as bot.py)
 GP_MIN_AMOUNT = 30
 GP_MAX_AMOUNT = 10000
