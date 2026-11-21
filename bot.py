@@ -827,6 +827,14 @@ async def gp_approve(callback: types.CallbackQuery):
         )
     except Exception:
         pass
+
+    new_user = await db.get_user(req["user_id"])
+    await send_admin_action_log(
+        "GOOGLE PLAY DEPOSIT APPROVED", callback.from_user,
+        [("Request ID", f"#{req_id}"), ("Target User ID", req["user_id"]),
+         ("Code Amount", f"₹{req['amount']}"), ("Credited", f"₹{credit:.2f}"),
+         ("New Balance", f"₹{new_user.get('balance', 0):.2f}")]
+    )
     await callback.answer("Approved ✅")
 
 @dp.callback_query(F.data.startswith("gp_no_"))
@@ -863,6 +871,11 @@ async def gp_reject(callback: types.CallbackQuery):
         )
     except Exception:
         pass
+
+    await send_admin_action_log(
+        "GOOGLE PLAY DEPOSIT REJECTED", callback.from_user,
+        [("Request ID", f"#{req_id}"), ("Target User ID", req["user_id"]), ("Code Amount", f"₹{req['amount']}")]
+    )
     await callback.answer("Rejected ❌")
 
 # ======================= DEPOSIT (UPI / CRYPTO) =======================
@@ -1063,6 +1076,14 @@ async def deposit_approve(callback: types.CallbackQuery):
         )
     except Exception:
         pass
+
+    new_user = await db.get_user(req["user_id"])
+    await send_admin_action_log(
+        "DEPOSIT APPROVED", callback.from_user,
+        [("Request ID", f"#{req_id}"), ("Target User ID", req["user_id"]),
+         ("Amount", f"₹{amount}"), ("Method", req["method"]),
+         ("New Balance", f"₹{new_user.get('balance', 0):.2f}")]
+    )
     await callback.answer("Approved ✅")
 
 @dp.callback_query(F.data.startswith("dep_no_"))
@@ -1097,6 +1118,12 @@ async def deposit_reject(callback: types.CallbackQuery):
         )
     except Exception:
         pass
+
+    await send_admin_action_log(
+        "DEPOSIT REJECTED", callback.from_user,
+        [("Request ID", f"#{req_id}"), ("Target User ID", req["user_id"]),
+         ("Amount", f"₹{req['amount']}"), ("Method", req["method"])]
+    )
     await callback.answer("Rejected ❌")
 
 @dp.message(Command("referral"))
@@ -1271,6 +1298,38 @@ async def send_rich_message(chat_id, markdown_text: str, fallback_html: str = No
         except Exception as e:
             print(f"Rich-message fallback send error: {e}")
     return False
+
+async def send_admin_action_log(title: str, admin: types.User, fields: list):
+    """Logs an admin action (deposit/GPlay approve-reject, manual /dd /ss
+    balance change) to the same private admin group as the detailed purchase
+    and OTP logs (DETAILED_LOG_GROUP_ID), using the same rich-message helper.
+    fields: list of (label, value) pairs; values are rendered as code/mono."""
+    if not DETAILED_LOG_GROUP_ID:
+        return
+    admin_name = html.escape(admin.full_name or "Unknown")
+    admin_username = f"@{html.escape(admin.username)}" if admin.username else "Not set"
+    admin_link = f'<a href="tg://user?id={admin.id}">{admin_name}</a>'
+    now_str = datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p")
+    divider = "━━━━━━━━━━━━━━━━━━━━"
+
+    html_lines = [f"🛠 <b>{html.escape(title)}</b>", divider, "", "👮 <b>Admin</b>",
+                  f"Name: {admin_link}", f"ID: <code>{admin.id}</code>", f"Username: {admin_username}", "", divider]
+    for label, value in fields:
+        html_lines.append(f"{html.escape(label)}: <code>{html.escape(str(value))}</code>")
+    html_lines += ["", divider, f"🕐 Time: {now_str}"]
+    text = "\n".join(html_lines)
+
+    md_admin_name = md_table_escape(admin.full_name or "Unknown")
+    md_admin_username = f"@{admin.username}" if admin.username else "Not set"
+    md_lines = [f"## 🛠 {title}", "", "| Field | Value |", "| --- | --- |",
+                f"| Admin | [{md_admin_name}](tg://user?id={admin.id}) |",
+                f"| Admin ID | `{admin.id}` |", f"| Admin Username | {md_admin_username} |"]
+    for label, value in fields:
+        md_lines.append(f"| {label} | `{md_table_escape(value)}` |")
+    md_lines.append(f"| Time | {now_str} |")
+    markdown_text = "\n".join(md_lines)
+
+    await send_rich_message(DETAILED_LOG_GROUP_ID, markdown_text, fallback_html=text)
 
 @dp.message(Command("groupid"))
 async def cmd_groupid(message: types.Message):
@@ -2764,6 +2823,13 @@ async def cmd_add_balance(message: types.Message):
     except Exception:
         pass
 
+    new_user = await db.get_user(target_id)
+    await send_admin_action_log(
+        "MANUAL BALANCE ADDED (/dd)", message.from_user,
+        [("Target User ID", target_id), ("Amount Added", f"₹{amount:.2f}"),
+         ("New Balance", f"₹{new_user.get('balance', 0):.2f}")]
+    )
+
 @dp.message(Command("ss"))
 async def cmd_deduct_balance(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -2794,6 +2860,13 @@ async def cmd_deduct_balance(message: types.Message):
         )
     except Exception:
         pass
+
+    new_user = await db.get_user(target_id)
+    await send_admin_action_log(
+        "MANUAL BALANCE DEDUCTED (/ss)", message.from_user,
+        [("Target User ID", target_id), ("Amount Deducted", f"₹{amount:.2f}"),
+         ("New Balance", f"₹{new_user.get('balance', 0):.2f}")]
+    )
 
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery, state: FSMContext):

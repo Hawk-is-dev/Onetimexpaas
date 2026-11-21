@@ -65,26 +65,38 @@ async def init_db():
         )
 
 
+_USER_DEFAULTS = {
+    "balance": 0.0,
+    "is_verified": 0,
+    "is_banned": 0,
+    "referred_by": None,
+    "referral_count": 0,
+    "referral_rewarded": 0,
+    "onboarded": 0,
+}
+
+
 async def get_user(user_id: int):
     try:
-        return await users_col.find_one_and_update(
+        user = await users_col.find_one_and_update(
             {"user_id": user_id},
-            {
-                "$setOnInsert": {
-                    "balance": 0.0,
-                    "is_verified": 0,
-                    "is_banned": 0,
-                    "referred_by": None,
-                    "referral_count": 0,
-                    "referral_rewarded": 0,
-                    "onboarded": 0,
-                }
-            },
+            {"$setOnInsert": _USER_DEFAULTS},
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
     except DuplicateKeyError:
-        return await users_col.find_one({"user_id": user_id})
+        user = await users_col.find_one({"user_id": user_id})
+
+    # Old/partial docs (created by /dd, /ss or deposit-approve upserts)
+    # miss some fields -> fill them in so /start never hits a KeyError.
+    missing = {k: v for k, v in _USER_DEFAULTS.items() if k not in user}
+    if missing:
+        await users_col.update_one(
+            {"user_id": user_id, **{k: {"$exists": False} for k in missing}},
+            {"$set": missing},
+        )
+        user.update(missing)
+    return user
 
 
 async def mark_onboarded(user_id: int):
