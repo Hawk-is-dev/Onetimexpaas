@@ -17,7 +17,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
 from config import BOT_TOKEN, OWNER_ID, CO_OWNER_ID, UPI_ID, REQUIRED_CHANNELS, ADMIN_LOG_GROUP_ID
 import database as db
-from userbot import start_userbot_for_account, active_clients, extract_account_info, get_devices, terminate_device, process_uploaded_session, terminate_bot_session, join_channel_with_session, logout_session, touch, cleanup_idle_clients
+from userbot import start_userbot_for_account, active_clients, extract_account_info, get_devices, terminate_device, process_uploaded_session, terminate_bot_session, join_channel_with_session, logout_session, touch, cleanup_idle_clients, start_phone_login, submit_phone_code, submit_phone_password, cancel_phone_login
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 
@@ -103,8 +103,24 @@ def sc(text: str) -> str:
     """Converts text to small-caps style (used for button labels and headings)."""
     return "".join(_SMALL_CAPS_MAP.get(ch.lower(), ch) for ch in text)
 
+# Admins added with /addadmin (stored in MongoDB, loaded at startup).
+DYNAMIC_ADMINS: set = set()
+
+
+def is_owner_level(user_id: int) -> bool:
+    """Owner / co-owner from env. Only these can add or remove admins."""
+    return user_id == OWNER_ID or (bool(CO_OWNER_ID) and user_id == CO_OWNER_ID)
+
+
 def is_admin(user_id: int) -> bool:
-    return user_id == OWNER_ID or user_id == CO_OWNER_ID
+    return is_owner_level(user_id) or user_id in DYNAMIC_ADMINS
+
+
+def all_admin_ids() -> list:
+    """Owner, co-owner and every admin added with /addadmin."""
+    ids = [OWNER_ID] + ([CO_OWNER_ID] if CO_OWNER_ID else [])
+    ids += [a for a in DYNAMIC_ADMINS if a not in ids]
+    return ids
 
 
 # ---------------- Ban middleware (applies to all handlers) ----------------
@@ -131,6 +147,11 @@ class AddItemState(StatesGroup):
     waiting_for_price = State()
     waiting_for_session = State()
     waiting_for_two_step = State()
+    # "Login with number" flow
+    waiting_for_method = State()
+    waiting_for_phone = State()
+    waiting_for_otp = State()
+    waiting_for_login_password = State()
 
 class AddCategoryState(StatesGroup):
     waiting_for_name = State()
@@ -183,7 +204,7 @@ async def set_bot_commands(bot_instance: Bot):
     ]
     await bot_instance.set_my_commands(user_commands, scope=BotCommandScopeDefault())
 
-    owner_commands = [
+    admin_commands = [
         BotCommand(command="start", description="Start the bot 🚀"),
         BotCommand(command="wallet", description="Open your wallet 💰"),
         BotCommand(command="myorders", description="View your purchase history 📦"),
@@ -199,12 +220,25 @@ async def set_bot_commands(bot_instance: Bot):
         BotCommand(command="dd", description="Add balance to a user 💰"),
         BotCommand(command="ss", description="Deduct balance from a user 💸"),
     ]
-    try:
-        await bot_instance.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
-        if CO_OWNER_ID:
-            await bot_instance.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=CO_OWNER_ID))
-    except Exception as e:
-        print(f"Command setup error: {e}")
+    # Only owner / co-owner can manage admins, so only they see these.
+    owner_extra_commands = [
+        BotCommand(command="addadmin", description="Add an admin: /addadmin <user_id> ➕"),
+        BotCommand(command="removeadmin", description="Remove an admin: /removeadmin <user_id> ➖"),
+        BotCommand(command="checkadmins", description="List all admins 👮"),
+    ]
+    owner_commands = admin_commands + owner_extra_commands
+
+    targets = [(OWNER_ID, owner_commands)]
+    if CO_OWNER_ID:
+        targets.append((CO_OWNER_ID, owner_commands))
+    targets += [(a, admin_commands) for a in DYNAMIC_ADMINS if a not in (OWNER_ID, CO_OWNER_ID)]
+
+    # One try per chat so a single "chat not found" doesn't skip the others.
+    for chat_id, cmds in targets:
+        try:
+            await bot_instance.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id=chat_id))
+        except Exception as e:
+            print(f"Command setup error for {chat_id}: {e}")
 
 async def check_user_channels(user_id: int) -> bool:
     if not REQUIRED_CHANNELS:
@@ -769,7 +803,7 @@ async def gp_get_screenshot(message: types.Message, state: FSMContext):
         InlineKeyboardButton(text=sc("❌ Reject"), callback_data=f"gp_no_{req_id}")
     ]])
 
-    admin_ids = [OWNER_ID] + ([CO_OWNER_ID] if CO_OWNER_ID else [])
+    admin_ids = all_admin_ids()
     delivered = False
     for admin_id in admin_ids:
         try:
@@ -1021,7 +1055,7 @@ async def deposit_confirm(callback: types.CallbackQuery, state: FSMContext):
         InlineKeyboardButton(text=sc("❌ Reject"), callback_data=f"dep_no_{req_id}")
     ]])
 
-    admin_ids = [OWNER_ID] + ([CO_OWNER_ID] if CO_OWNER_ID else [])
+    admin_ids = all_admin_ids()
     delivered = False
     for admin_id in admin_ids:
         try:
@@ -1559,7 +1593,7 @@ async def report_issue_submit(message: types.Message, state: FSMContext):
         f"📝 Description:\n{html.escape(description)}"
     )
 
-    admin_ids = [OWNER_ID] + ([CO_OWNER_ID] if CO_OWNER_ID else [])
+    admin_ids = all_admin_ids()
     delivered = False
     for admin_id in admin_ids:
         try:
@@ -2505,6 +2539,7 @@ async def admin_add_acc(event: types.Message | types.CallbackQuery, state: FSMCo
         return
 
     await state.clear()
+    await cancel_phone_login(user_id)
     tiers = await db.get_tiers()
     kb = [[InlineKeyboardButton(text=sc(name), callback_data=f"addacctier_{tid}")] for tid, name in tiers]
     kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
@@ -2540,6 +2575,7 @@ def admin_cancel_kb():
 @dp.callback_query(F.data == "admin_add_cancel")
 async def admin_add_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    await cancel_phone_login(callback.from_user.id)
     await admin_panel(callback)
 
 @dp.callback_query(F.data.startswith("selcat_"))
@@ -2579,16 +2615,189 @@ async def get_price(message: types.Message, state: FSMContext):
         return
 
     await state.update_data(price=price)
-    await state.set_state(AddItemState.waiting_for_session)
+    await state.set_state(AddItemState.waiting_for_method)
     await message.answer(
+        sc("🔑 how do you want to add the account?"),
+        reply_markup=add_method_kb()
+    )
+
+
+def add_method_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=sc("📁 Session / Zip / String"), callback_data="addsess_file")],
+        [InlineKeyboardButton(text=sc("📱 Login with Number"), callback_data="addsess_phone")],
+        [InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_add_cancel")],
+    ])
+
+
+def add_method_back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="addsess_back")],
+        [InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_add_cancel")],
+    ])
+
+
+@dp.callback_query(F.data == "addsess_back")
+async def addsess_back(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await cancel_phone_login(callback.from_user.id)
+    await state.set_state(AddItemState.waiting_for_method)
+    await callback.message.edit_text(
+        sc("🔑 how do you want to add the account?"),
+        reply_markup=add_method_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "addsess_file")
+async def addsess_file(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AddItemState.waiting_for_session)
+    await callback.message.edit_text(
         sc("🔑 send the account session. any of these work:\n") +
         sc("• a telethon session string (as text)\n") +
         sc("• a pyrogram session string (as text)\n") +
         sc("• a telethon or pyrogram ") + "`.session`" + sc(" file\n") +
         sc("• a ") + "`.zip`" + sc(" file containing a ") + "`.session`" + sc(" file or a tdata folder"),
         parse_mode="Markdown",
-        reply_markup=admin_cancel_kb()
+        reply_markup=add_method_back_kb()
     )
+    await callback.answer()
+
+
+# ---------------- Login with phone number: number -> OTP -> (2FA) ----------------
+@dp.callback_query(F.data == "addsess_phone")
+async def addsess_phone(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AddItemState.waiting_for_phone)
+    await callback.message.edit_text(
+        sc("📱 send the phone number with country code\n(e.g. +919876543210):"),
+        reply_markup=add_method_back_kb()
+    )
+    await callback.answer()
+
+
+@dp.message(AddItemState.waiting_for_phone)
+async def get_login_phone(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    phone = re.sub(r"[\s\-\(\)]", "", raw)
+    if phone.startswith("00"):
+        phone = "+" + phone[2:]
+    elif phone.isdigit():
+        phone = "+" + phone
+    if not re.fullmatch(r"\+\d{7,15}", phone):
+        await message.answer(
+            sc("❌ invalid number. send it with country code, e.g. +919876543210:"),
+            reply_markup=add_method_back_kb()
+        )
+        return
+
+    wait_msg = await message.answer(sc("📨 sending login code, please wait..."))
+    ok, err = await start_phone_login(message.from_user.id, phone)
+    if not ok:
+        await wait_msg.edit_text(
+            sc("❌ could not send code.\n\nreason: ") + f"{err}\n\n" +
+            sc("send the number again:"),
+            reply_markup=add_method_back_kb()
+        )
+        return
+
+    await state.update_data(login_phone=phone)
+    await state.set_state(AddItemState.waiting_for_otp)
+    await wait_msg.edit_text(
+        sc("✅ code sent to ") + phone + sc(" (check the telegram app or sms).\n\n") +
+        sc("now send the code with spaces between the digits, e.g. ") + "1 2 3 4 5\n" +
+        sc("(telegram can expire a code that is sent as plain digits)"),
+        reply_markup=add_method_back_kb()
+    )
+
+
+@dp.message(AddItemState.waiting_for_otp)
+async def get_login_otp(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    digits = re.sub(r"\D", "", message.text or "")
+    if not 4 <= len(digits) <= 8:
+        await message.answer(
+            sc("❌ send the login code (digits only, e.g. 1 2 3 4 5):"),
+            reply_markup=add_method_back_kb()
+        )
+        return
+    try:
+        await message.delete()   # don't leave the code lying in the chat
+    except Exception:
+        pass
+
+    status, payload = await submit_phone_code(message.from_user.id, digits)
+    await _handle_login_result(message, state, status, payload, retry_prompt="send the code again:")
+
+
+@dp.message(AddItemState.waiting_for_login_password)
+async def get_login_password(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    password = (message.text or "").strip()
+    if not password:
+        await message.answer(sc("❌ send the 2-step password as text:"), reply_markup=add_method_back_kb())
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    status, payload = await submit_phone_password(message.from_user.id, password)
+    await _handle_login_result(message, state, status, payload, retry_prompt="send the password again:")
+
+
+async def _handle_login_result(message: types.Message, state: FSMContext, status: str, payload, retry_prompt: str):
+    chat_id = message.chat.id
+    if status == "retry":
+        await bot.send_message(chat_id, sc(f"❌ {payload} {retry_prompt}"), reply_markup=add_method_back_kb())
+        return
+
+    if status == "password":
+        await state.set_state(AddItemState.waiting_for_login_password)
+        await bot.send_message(
+            chat_id,
+            sc("🔐 this account has 2-step verification.\nsend its password:"),
+            reply_markup=add_method_back_kb()
+        )
+        return
+
+    if status == "error":
+        await state.set_state(AddItemState.waiting_for_method)
+        await bot.send_message(
+            chat_id,
+            sc("❌ login failed.\n\nreason: ") + f"{payload}\n\n" + sc("choose a method to try again:"),
+            reply_markup=add_method_kb()
+        )
+        return
+
+    # status == "ok": payload is the account info -> same save flow as before
+    info = payload
+    await state.update_data(
+        session_string=info["session_string"],
+        phone_number=info["phone_number"],
+        telegram_user_id=info["user_id"],
+        two_step_enabled=info["two_step_enabled"],
+        two_step=info.get("two_step_password", ""),
+    )
+    status_line = sc("on") if info["two_step_enabled"] else sc("off")
+    await bot.send_message(
+        chat_id,
+        sc("✅ logged in!\n\n") +
+        sc("📱 phone   : ") + f"`{info['phone_number']}`\n" +
+        sc("🆔 user id : ") + f"`{info['user_id']}`\n" +
+        sc("🔐 2-step verification : ") + f"**{status_line}**",
+        parse_mode="Markdown"
+    )
+    await finalize_add_account(message, state)
+
 
 @dp.message(AddItemState.waiting_for_session)
 async def get_session(message: types.Message, state: FSMContext):
@@ -2868,6 +3077,115 @@ async def cmd_deduct_balance(message: types.Message):
          ("New Balance", f"₹{new_user.get('balance', 0):.2f}")]
     )
 
+# ---------------- Admin management: /addadmin /removeadmin /checkadmins ----------------
+# Only the owner / co-owner (from env) can use these.
+ADMIN_ID_RE = re.compile(r"\d{5,15}")
+
+
+async def _describe_user(uid: int) -> str:
+    """'Name @username' if the bot can see this user, else ''."""
+    try:
+        chat = await bot.get_chat(uid)
+        name = html.escape(chat.full_name or chat.first_name or "")
+        uname = f" @{html.escape(chat.username)}" if chat.username else ""
+        return f"{name}{uname}".strip()
+    except Exception:
+        return ""
+
+
+@dp.message(Command("addadmin"))
+async def cmd_addadmin(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not ADMIN_ID_RE.fullmatch(parts[1]):
+        await message.answer("Usage: /addadmin <user_id>\nExample: /addadmin 123456789")
+        return
+
+    target = int(parts[1])
+    if is_owner_level(target):
+        await message.answer("ℹ️ That user is already the owner/co-owner.")
+        return
+    if target in DYNAMIC_ADMINS:
+        await message.answer("ℹ️ That user is already an admin.")
+        return
+
+    await db.add_admin(target, message.from_user.id)
+    DYNAMIC_ADMINS.add(target)
+    await set_bot_commands(bot)   # gives the new admin the admin command menu
+
+    who = await _describe_user(target)
+    note = "" if who else "\n⚠️ The bot can't see this user yet. Ask them to send /start to the bot once."
+    await message.answer(f"✅ Admin added: <code>{target}</code> {who}{note}", parse_mode="HTML")
+
+    try:
+        await bot.send_message(target, "👮 You have been added as an admin of this bot.\nSend /admin to open the admin panel.")
+    except Exception:
+        pass
+
+    await send_admin_action_log(
+        "ADMIN ADDED (/addadmin)", message.from_user,
+        [("New Admin ID", target)]
+    )
+
+
+@dp.message(Command("removeadmin"))
+async def cmd_removeadmin(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not ADMIN_ID_RE.fullmatch(parts[1]):
+        await message.answer("Usage: /removeadmin <user_id>\nExample: /removeadmin 123456789")
+        return
+
+    target = int(parts[1])
+    if is_owner_level(target):
+        await message.answer("❌ You can't remove the owner/co-owner.")
+        return
+    if target not in DYNAMIC_ADMINS:
+        await message.answer("ℹ️ That user is not an admin.")
+        return
+
+    await db.remove_admin(target)
+    DYNAMIC_ADMINS.discard(target)
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=target))
+    except Exception:
+        pass
+
+    await message.answer(f"✅ Admin removed: <code>{target}</code>", parse_mode="HTML")
+    try:
+        await bot.send_message(target, "ℹ️ You are no longer an admin of this bot.")
+    except Exception:
+        pass
+
+    await send_admin_action_log(
+        "ADMIN REMOVED (/removeadmin)", message.from_user,
+        [("Removed Admin ID", target)]
+    )
+
+
+@dp.message(Command("checkadmins"))
+async def cmd_checkadmins(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+
+    lines = ["👮 <b>Admins</b>", "", f"👑 Owner: <code>{OWNER_ID}</code> {await _describe_user(OWNER_ID)}".rstrip()]
+    if CO_OWNER_ID:
+        lines.append(f"🤝 Co-owner: <code>{CO_OWNER_ID}</code> {await _describe_user(CO_OWNER_ID)}".rstrip())
+
+    docs = await db.get_admins()
+    lines.append("")
+    if not docs:
+        lines.append("No extra admins added yet.\nUse /addadmin &lt;user_id&gt;")
+    else:
+        lines.append(f"➕ Added admins ({len(docs)}):")
+        for i, a in enumerate(docs, 1):
+            uid = a["user_id"]
+            lines.append(f"{i}. <code>{uid}</code> {await _describe_user(uid)}".rstrip())
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -2875,6 +3193,7 @@ async def back_home(callback: types.CallbackQuery, state: FSMContext):
 
 async def main():
     await db.init_db()
+    DYNAMIC_ADMINS.update(a["user_id"] for a in await db.get_admins())
     await set_bot_commands(bot)
     asyncio.create_task(cleanup_idle_clients())
     await dp.start_polling(bot)

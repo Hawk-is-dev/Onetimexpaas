@@ -13,6 +13,10 @@ from telethon.errors import (
     UserAlreadyParticipantError, FloodWaitError, ChannelPrivateError,
     InviteHashExpiredError, InviteHashInvalidError, UserDeactivatedBanError,
     UserDeactivatedError, AuthKeyUnregisteredError, ChannelsTooMuchError,
+    PhoneNumberInvalidError, PhoneNumberBannedError, PhoneNumberFloodError,
+    PhoneNumberUnoccupiedError, PhoneCodeInvalidError, PhoneCodeExpiredError,
+    PhoneCodeEmptyError, SessionPasswordNeededError, PasswordHashInvalidError,
+    ApiIdInvalidError,
 )
 from config import API_ID, API_HASH
 
@@ -475,3 +479,139 @@ async def start_userbot_for_account(phone_number: str, session_string: str, bot_
         touch(phone_number)
     except Exception as e:
         print(f"Error starting userbot for {phone_number}: {e}")
+
+
+# ---------------- Login with phone number (OTP + optional 2FA) ----------------
+# One pending login per admin (key = admin's Telegram user id).
+pending_logins = {}   # admin_id -> {"client", "phone", "hash", "ts"}
+LOGIN_TIMEOUT_SECONDS = 600   # abandoned logins are dropped after 10 minutes
+
+
+async def cancel_phone_login(admin_id: int):
+    """Drops a pending login (if any) and closes its connection."""
+    entry = pending_logins.pop(admin_id, None)
+    if entry:
+        try:
+            await entry["client"].disconnect()
+        except Exception:
+            pass
+
+
+async def _get_login(admin_id: int):
+    entry = pending_logins.get(admin_id)
+    if not entry:
+        return None
+    age = (datetime.now(timezone.utc) - entry["ts"]).total_seconds()
+    if age > LOGIN_TIMEOUT_SECONDS:
+        await cancel_phone_login(admin_id)
+        return None
+    return entry
+
+
+async def start_phone_login(admin_id: int, phone: str):
+    """Sends the login code to `phone`. Returns (True, None) or (False, error)."""
+    await cancel_phone_login(admin_id)
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    err = None
+    try:
+        await client.connect()
+        sent = await client.send_code_request(phone)
+    except PhoneNumberInvalidError:
+        err = "Invalid phone number."
+    except PhoneNumberBannedError:
+        err = "This number is banned by Telegram."
+    except (PhoneNumberFloodError, FloodWaitError) as e:
+        secs = getattr(e, "seconds", None)
+        err = f"Too many attempts. Try again in {secs} seconds." if secs else "Too many attempts. Try again later."
+    except ApiIdInvalidError:
+        err = "API_ID / API_HASH is invalid on the server."
+    except Exception as e:
+        err = str(e) or e.__class__.__name__
+
+    if err:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return False, err
+
+    pending_logins[admin_id] = {
+        "client": client,
+        "phone": phone,
+        "hash": sent.phone_code_hash,
+        "ts": datetime.now(timezone.utc),
+    }
+    return True, None
+
+
+async def _finish_login(admin_id: int, entry: dict, password: str = ""):
+    """Builds the same info dict as process_uploaded_session()."""
+    client = entry["client"]
+    try:
+        me = await client.get_me()
+        two_step_enabled = bool(password)
+        try:
+            pwd = await client(GetPasswordRequest())
+            two_step_enabled = bool(getattr(pwd, "has_password", False))
+        except Exception:
+            pass
+        return "ok", {
+            "phone_number": me.phone or entry["phone"].lstrip("+"),
+            "user_id": me.id,
+            "username": me.username,
+            "two_step_enabled": two_step_enabled,
+            "two_step_password": password or "",
+            "session_string": StringSession.save(client.session),
+        }
+    except Exception as e:
+        return "error", str(e) or e.__class__.__name__
+    finally:
+        await cancel_phone_login(admin_id)
+
+
+async def submit_phone_code(admin_id: int, code: str):
+    """Returns (status, payload):
+       ("ok", info) | ("password", None) | ("retry", msg) | ("error", msg)"""
+    entry = await _get_login(admin_id)
+    if not entry:
+        return "error", "Login session expired. Please start again."
+    client = entry["client"]
+    try:
+        await client.sign_in(phone=entry["phone"], code=code, phone_code_hash=entry["hash"])
+    except SessionPasswordNeededError:
+        return "password", None
+    except (PhoneCodeInvalidError, PhoneCodeEmptyError):
+        return "retry", "Wrong code."
+    except PhoneCodeExpiredError:
+        await cancel_phone_login(admin_id)
+        return "error", "Code expired. Please start again."
+    except PhoneNumberUnoccupiedError:
+        await cancel_phone_login(admin_id)
+        return "error", "This number is not registered on Telegram."
+    except FloodWaitError as e:
+        await cancel_phone_login(admin_id)
+        return "error", f"Too many attempts. Try again in {e.seconds} seconds."
+    except Exception as e:
+        await cancel_phone_login(admin_id)
+        return "error", str(e) or e.__class__.__name__
+    return await _finish_login(admin_id, entry)
+
+
+async def submit_phone_password(admin_id: int, password: str):
+    """2-step password step. Same return format as submit_phone_code()."""
+    entry = await _get_login(admin_id)
+    if not entry:
+        return "error", "Login session expired. Please start again."
+    client = entry["client"]
+    try:
+        await client.sign_in(password=password)
+    except PasswordHashInvalidError:
+        return "retry", "Wrong password."
+    except FloodWaitError as e:
+        await cancel_phone_login(admin_id)
+        return "error", f"Too many attempts. Try again in {e.seconds} seconds."
+    except Exception as e:
+        await cancel_phone_login(admin_id)
+        return "error", str(e) or e.__class__.__name__
+    return await _finish_login(admin_id, entry, password)
+

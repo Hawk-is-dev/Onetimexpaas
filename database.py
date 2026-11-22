@@ -19,6 +19,7 @@ gp_codes_col = db["gp_codes"]
 deposit_requests_col = db["deposit_requests"]
 otp_logs_col = db["otp_logs"]
 joined_channels_col = db["joined_channels"]
+admins_col = db["admins"]
 
 
 async def get_next_sequence(name: str) -> int:
@@ -40,6 +41,7 @@ async def init_db():
     await categories_col.create_index([("name", 1), ("tier_id", 1)], unique=True)
     await accounts_col.create_index("account_id", unique=True)
     await users_col.create_index("user_id", unique=True)
+    await admins_col.create_index("user_id", unique=True)
 
     # Seed the default types if they don't exist yet (admin can add more later)
     default_tier_names = ["Fresh", "Old", "Spam"]
@@ -497,3 +499,28 @@ async def set_deposit_status(req_id: int, status: str):
         {"$set": {"status": status, "reviewed_at": datetime.now(timezone.utc)}},
         return_document=ReturnDocument.AFTER,
     )
+
+
+# ---------------- Dynamic admins (/addadmin, /removeadmin, /checkadmins) ----------------
+async def add_admin(user_id: int, added_by: int) -> bool:
+    """Returns True if newly added, False if already an admin."""
+    try:
+        await admins_col.insert_one({
+            "user_id": user_id,
+            "added_by": added_by,
+            "added_at": datetime.now(timezone.utc),
+        })
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+async def remove_admin(user_id: int) -> bool:
+    result = await admins_col.delete_one({"user_id": user_id})
+    return result.deleted_count > 0
+
+
+async def get_admins() -> list:
+    """List of admin docs, oldest first."""
+    return [a async for a in admins_col.find({}).sort("added_at", 1)]
+
