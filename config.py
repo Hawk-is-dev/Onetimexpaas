@@ -54,3 +54,9 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is missing!")
 if not MONGO_URI:
     raise ValueError("MONGO_URI is missing!")
+
+# Optional: Fernet key that protects the daily backup file (sessions included, encrypted).
+# Without it the backup is still sent, but session strings / 2FA / API keys are left out.
+# Make one with:  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+BACKUP_KEY = _clean("BACKUP_KEY")
+

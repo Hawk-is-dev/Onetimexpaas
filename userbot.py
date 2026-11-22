@@ -16,7 +16,7 @@ from telethon.errors import (
     PhoneNumberInvalidError, PhoneNumberBannedError, PhoneNumberFloodError,
     PhoneNumberUnoccupiedError, PhoneCodeInvalidError, PhoneCodeExpiredError,
     PhoneCodeEmptyError, SessionPasswordNeededError, PasswordHashInvalidError,
-    ApiIdInvalidError,
+    ApiIdInvalidError, SessionRevokedError, SessionExpiredError, AuthKeyDuplicatedError,
 )
 from config import API_ID, API_HASH
 
@@ -614,4 +614,35 @@ async def submit_phone_password(admin_id: int, password: str):
         await cancel_phone_login(admin_id)
         return "error", str(e) or e.__class__.__name__
     return await _finish_login(admin_id, entry, password)
+
+
+# ---------------- Dead-session check (used by the daily checker and /checksessions) ----------------
+async def check_session_alive(session_string: str):
+    """Opens the session briefly and returns (status, reason):
+       ("alive", None) | ("dead", reason) | ("unknown", reason)
+       'unknown' means we could not tell (flood wait, network...) - the account is NOT flagged."""
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return "dead", "Session is no longer authorized"
+        await client.get_me()
+        return "alive", None
+    except UserDeactivatedBanError:
+        return "dead", "Account banned by Telegram"
+    except UserDeactivatedError:
+        return "dead", "Account deleted / deactivated"
+    except (AuthKeyUnregisteredError, SessionRevokedError, SessionExpiredError):
+        return "dead", "Session revoked or expired"
+    except AuthKeyDuplicatedError:
+        return "dead", "Session used from two places (auth key duplicated)"
+    except FloodWaitError as e:
+        return "unknown", f"FloodWait {getattr(e, 'seconds', '?')}s"
+    except Exception as e:
+        return "unknown", (str(e) or e.__class__.__name__)[:80]
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 

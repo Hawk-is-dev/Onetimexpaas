@@ -7,7 +7,8 @@ import shutil
 import tempfile
 import random
 import html
-from datetime import datetime, timezone
+import gzip
+from datetime import datetime, timedelta, timezone
 import aiohttp
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command
@@ -15,9 +16,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, LabeledPrice, PreCheckoutQuery, Message
 
-from config import BOT_TOKEN, OWNER_ID, CO_OWNER_ID, UPI_ID, REQUIRED_CHANNELS, ADMIN_LOG_GROUP_ID
+from config import BOT_TOKEN, OWNER_ID, CO_OWNER_ID, UPI_ID, REQUIRED_CHANNELS, ADMIN_LOG_GROUP_ID, BACKUP_KEY
 import database as db
-from userbot import start_userbot_for_account, active_clients, extract_account_info, get_devices, terminate_device, process_uploaded_session, terminate_bot_session, join_channel_with_session, logout_session, touch, cleanup_idle_clients, start_phone_login, submit_phone_code, submit_phone_password, cancel_phone_login
+from userbot import start_userbot_for_account, active_clients, extract_account_info, get_devices, terminate_device, process_uploaded_session, terminate_bot_session, join_channel_with_session, logout_session, touch, cleanup_idle_clients, start_phone_login, submit_phone_code, submit_phone_password, cancel_phone_login, check_session_alive
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 
@@ -190,6 +191,7 @@ class GPTopupState(StatesGroup):
 class DepositState(StatesGroup):
     waiting_for_amount = State()
     waiting_for_screenshot = State()
+    waiting_for_utr = State()
 
 class StarsTopupState(StatesGroup):
     waiting_for_amount = State()
@@ -225,11 +227,18 @@ async def set_bot_commands(bot_instance: Bot):
         BotCommand(command="add", description="Add new account ➕"),
         BotCommand(command="groupid", description="Get this chat's ID 🆔"),
         BotCommand(command="checkchannels", description="Diagnose required-channel membership checks 🔍"),
+        BotCommand(command="user", description="User profile: /user <user_id> 👤"),
+        BotCommand(command="ledger", description="Balance history: /ledger <user_id> 💳"),
+        BotCommand(command="acc", description="Account details: /acc <number or id> 📱"),
+        BotCommand(command="stats", description="Shop statistics 📊"),
         BotCommand(command="dd", description="Add balance to a user 💰"),
         BotCommand(command="ss", description="Deduct balance from a user 💸"),
     ]
     # Only owner / co-owner can manage admins, so only they see these.
     owner_extra_commands = [
+        BotCommand(command="auditlog", description="Recent admin actions 🧾"),
+        BotCommand(command="checksessions", description="Check stock sessions now 🩺"),
+        BotCommand(command="backup", description="Create a database backup now 💾"),
         BotCommand(command="setqr", description="Reply to a QR photo with /setqr to set deposit QR 🖼"),
         BotCommand(command="setupi", description="Set UPI ID: /setupi <upi_id> 🆔"),
         BotCommand(command="removeqr", description="Remove the deposit QR 🗑"),
@@ -390,10 +399,15 @@ async def verify_membership_callback(callback: types.CallbackQuery):
                 {"$set": {"referral_rewarded": 1}}
             )
             if res.modified_count == 1:
-                await db.users_col.update_one(
+                ref_doc = await db.users_col.find_one_and_update(
                     {"user_id": referrer_id},
-                    {"$inc": {"referral_count": 1, "balance": 0.001}}
+                    {"$inc": {"referral_count": 1, "balance": 0.001}},
+                    return_document=db.ReturnDocument.AFTER,
                 )
+                try:
+                    await db.add_ledger(referrer_id, 0.001, "referral_bonus", ref=user_id, balance_after=(ref_doc or {}).get("balance"))
+                except Exception as e:
+                    print(f"Ledger write failed: {e}")
                 try:
                     await bot.send_message(
                         referrer_id,
@@ -688,7 +702,7 @@ async def process_stars_successful_payment(message: Message):
     if not is_new:
         return
 
-    await db.update_balance(user_id, inr_added)
+    await db.update_balance(user_id, inr_added, reason="stars_topup")
     user_data = await db.get_user(user_id)
     new_balance = user_data.get("balance", 0.0) if user_data else 0.0
 
@@ -856,7 +870,7 @@ async def gp_approve(callback: types.CallbackQuery):
         return
 
     credit = req["amount"] * GP_RATE
-    await db.update_balance(req["user_id"], credit)
+    await db.update_balance(req["user_id"], credit, reason="gplay_topup", ref=req_id, by=callback.from_user.id)
     await db.save_payment_record(req["user_id"], credit, "GPLAY", "TOPUP_SUCCESS")
 
     try:
@@ -935,6 +949,8 @@ def deposit_admin_caption(req: dict, status_line: str = "") -> str:
         f"💰 Amount: ₹{req['amount']}\n"
         f"🏦 Method: {req['method']}"
     )
+    if req.get("utr"):
+        text += f"\n🔑 UTR: <code>{html.escape(str(req['utr']))}</code>"
     if status_line:
         text += f"\n\n{status_line}"
     return text
@@ -1032,15 +1048,55 @@ async def deposit_get_screenshot(message: types.Message, state: FSMContext):
         return
 
     file_id = message.photo[-1].file_id
-    await state.update_data(dep_file_id=file_id)
+    unique_id = message.photo[-1].file_unique_id
 
+    # the same screenshot can't be used for a second deposit
+    if await db.deposit_proof_used("shot", unique_id):
+        await message.answer(
+            "❌ This screenshot was already used for another deposit. Please send your own payment screenshot.",
+            reply_markup=gp_cancel_kb()
+        )
+        return
+
+    await state.update_data(dep_file_id=file_id, dep_unique_id=unique_id)
+    await state.set_state(DepositState.waiting_for_utr)
+    await message.answer(
+        "🔑 Now send the **UTR / Transaction ID** of this payment (shown in your UPI app, usually 12 digits).",
+        parse_mode="Markdown",
+        reply_markup=gp_cancel_kb()
+    )
+
+
+@dp.message(DepositState.waiting_for_utr)
+async def deposit_get_utr(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    amount = data.get("dep_amount")
+    file_id = data.get("dep_file_id")
+    if not amount or not file_id:
+        await state.clear()
+        await message.answer("❌ Session expired. Please start again from the wallet.")
+        return
+
+    utr = re.sub(r"\s", "", message.text or "").upper()
+    if not re.fullmatch(r"[A-Z0-9]{10,25}", utr):
+        await message.answer(
+            "❌ Invalid UTR. Send the transaction ID from your payment app (10-25 letters/digits, usually 12 digits):",
+            reply_markup=gp_cancel_kb()
+        )
+        return
+    if await db.deposit_proof_used("utr", utr):
+        await message.answer("❌ This UTR was already used for another deposit.", reply_markup=gp_cancel_kb())
+        return
+
+    await state.update_data(dep_utr=utr)
+    await state.set_state(None)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=sc("✅ Confirm"), callback_data="dep_confirm"),
         InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="dep_cancel_screenshot")
     ]])
     await message.answer_photo(
         file_id,
-        caption=f"💰 Amount: ₹{amount}\n\nConfirm to submit the receipt?",
+        caption=f"💰 Amount: ₹{amount}\n🔑 UTR: {utr}\n\nConfirm to submit the receipt?",
         reply_markup=kb
     )
 
@@ -1063,10 +1119,25 @@ async def deposit_confirm(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Session expired.", show_alert=True)
         return
 
-    req_id, result = await db.create_deposit_request(callback.from_user.id, amount, "UPI", file_id)
+    utr = data.get("dep_utr")
+    unique_id = data.get("dep_unique_id")
+
+    # claim the UTR + screenshot (atomic) so they can never be reused
+    claim = await db.claim_deposit_proofs(callback.from_user.id, utr, unique_id)
+    if claim != "ok":
+        await state.clear()
+        await callback.message.edit_caption(
+            caption="❌ This UTR / screenshot was already used for another deposit.",
+            reply_markup=None
+        )
+        await callback.answer()
+        return
+
+    req_id, result = await db.create_deposit_request(callback.from_user.id, amount, "UPI", file_id, utr=utr, file_unique_id=unique_id)
     await state.clear()
 
     if result == "pending":
+        await db.release_deposit_proofs(utr, unique_id)
         await callback.message.edit_caption(
             caption="❌ You already have a pending deposit request. Please wait until it is reviewed.",
             reply_markup=None
@@ -1091,6 +1162,7 @@ async def deposit_confirm(callback: types.CallbackQuery, state: FSMContext):
 
     if not delivered:
         await db.set_deposit_status(req_id, "rejected")
+        await db.release_deposit_proofs(utr, unique_id)
         await callback.message.edit_caption(caption="⚠️ Could not submit your request right now. Please try again later.", reply_markup=None)
         await callback.answer()
         return
@@ -1116,7 +1188,7 @@ async def deposit_approve(callback: types.CallbackQuery):
         return
 
     amount = req["amount"]
-    await db.update_balance(req["user_id"], amount)
+    await db.update_balance(req["user_id"], amount, reason="deposit_topup", ref=req_id, by=callback.from_user.id)
     await db.save_payment_record(req["user_id"], amount, "DEPOSIT", "TOPUP_SUCCESS")
 
     try:
@@ -1158,6 +1230,8 @@ async def deposit_reject(callback: types.CallbackQuery):
         except Exception:
             pass
         return
+
+    await db.release_deposit_proofs(req.get("utr"), req.get("file_unique_id"))
 
     try:
         await bot.send_message(
@@ -1358,37 +1432,101 @@ async def send_rich_message(chat_id, markdown_text: str, fallback_html: str = No
             print(f"Rich-message fallback send error: {e}")
     return False
 
-async def send_admin_action_log(title: str, admin: types.User, fields: list):
-    """Logs an admin action (deposit/GPlay approve-reject, manual /dd /ss
-    balance change) to the same private admin group as the detailed purchase
-    and OTP logs (DETAILED_LOG_GROUP_ID), using the same rich-message helper.
+IST = timezone(timedelta(hours=5, minutes=30))   # all daily jobs / report times are IST
+
+
+def fmt_ts(dt) -> str:
+    """Mongo datetime -> '22 Nov 2026, 10:00 PM IST' (naive values are UTC)."""
+    if not dt:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+
+
+def _fmt_md(value, style: str) -> str:
+    v = md_table_escape("—" if value in (None, "") else value)
+    return f"`{v}`" if style == "code" else (f"**{v}**" if style == "bold" else v)
+
+
+def _fmt_html(value, style: str) -> str:
+    v = html.escape(str("—" if value in (None, "") else value))
+    return f"<code>{v}</code>" if style == "code" else (f"<b>{v}</b>" if style == "bold" else v)
+
+
+async def send_rich_table(chat_id, title: str, rows: list, footer: str = None):
+    """Two-column rich table. rows: (label, value) or (label, value, style)
+    with style = 'code' | 'bold' | 'plain'. Falls back to HTML automatically."""
+    md = [f"## {title}", "", "| Field | Value |", "| --- | --- |"]
+    ht = [f"<b>{html.escape(title)}</b>", "━━━━━━━━━━━━━━━━━━━━", ""]
+    for row in rows:
+        label, value = row[0], row[1]
+        style = row[2] if len(row) > 2 else "plain"
+        md.append(f"| {md_table_escape(label)} | {_fmt_md(value, style)} |")
+        ht.append(f"{html.escape(str(label))}: {_fmt_html(value, style)}")
+    if footer:
+        md += ["", md_table_escape(footer)]
+        ht += ["", html.escape(footer)]
+    return await send_rich_message(chat_id, "\n".join(md), fallback_html="\n".join(ht))
+
+
+async def send_rich_grid(chat_id, title: str, headers: list, rows: list, footer: str = None):
+    """Multi-column rich table (ledger, audit log, lists)."""
+    md = [f"## {title}", "", "| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    ht = [f"<b>{html.escape(title)}</b>", "━━━━━━━━━━━━━━━━━━━━", ""]
+    if not rows:
+        md.append("| " + " | ".join(["—"] * len(headers)) + " |")
+        ht.append("No records.")
+    for r in rows:
+        md.append("| " + " | ".join(md_table_escape(c) for c in r) + " |")
+        ht.append("• " + " | ".join(html.escape(str(c)) for c in r))
+    if footer:
+        md += ["", md_table_escape(footer)]
+        ht += ["", html.escape(footer)]
+    return await send_rich_message(chat_id, "\n".join(md), fallback_html="\n".join(ht))
+
+
+async def send_admin_action_log(title: str, admin, fields: list):
+    """Every admin / owner / co-owner action: saved to the audit log (/auditlog) and
+    posted to the private admin group (DETAILED_LOG_GROUP_ID) as a rich message.
+    admin=None means an automatic/system action.
     fields: list of (label, value) pairs; values are rendered as code/mono."""
+    try:
+        await db.add_audit(
+            admin.id if admin else 0,
+            (admin.full_name if admin else "System"),
+            (admin.username if admin else None),
+            title, fields,
+        )
+    except Exception as e:
+        print(f"Audit log save error: {e}")
+
     if not DETAILED_LOG_GROUP_ID:
         return
-    admin_name = html.escape(admin.full_name or "Unknown")
-    admin_username = f"@{html.escape(admin.username)}" if admin.username else "Not set"
-    admin_link = f'<a href="tg://user?id={admin.id}">{admin_name}</a>'
-    now_str = datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p")
+    now_str = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
     divider = "━━━━━━━━━━━━━━━━━━━━"
 
-    html_lines = [f"🛠 <b>{html.escape(title)}</b>", divider, "", "👮 <b>Admin</b>",
-                  f"Name: {admin_link}", f"ID: <code>{admin.id}</code>", f"Username: {admin_username}", "", divider]
+    html_lines = [f"🛠 <b>{html.escape(title)}</b>", divider, ""]
+    md_lines = [f"## 🛠 {title}", "", "| Field | Value |", "| --- | --- |"]
+    if admin:
+        admin_name = html.escape(admin.full_name or "Unknown")
+        admin_username = f"@{html.escape(admin.username)}" if admin.username else "Not set"
+        admin_link = f'<a href="tg://user?id={admin.id}">{admin_name}</a>'
+        html_lines += ["👮 <b>Admin</b>", f"Name: {admin_link}", f"ID: <code>{admin.id}</code>", f"Username: {admin_username}", "", divider]
+        md_admin_name = md_table_escape(admin.full_name or "Unknown")
+        md_admin_username = f"@{admin.username}" if admin.username else "Not set"
+        md_lines += [f"| Admin | [{md_admin_name}](tg://user?id={admin.id}) |",
+                     f"| Admin ID | `{admin.id}` |", f"| Admin Username | {md_admin_username} |"]
+    else:
+        html_lines += ["🤖 <b>Automatic action</b>", "", divider]
+        md_lines.append("| Source | Automatic |")
     for label, value in fields:
         html_lines.append(f"{html.escape(label)}: <code>{html.escape(str(value))}</code>")
+        md_lines.append(f"| {md_table_escape(label)} | `{md_table_escape(value)}` |")
     html_lines += ["", divider, f"🕐 Time: {now_str}"]
-    text = "\n".join(html_lines)
-
-    md_admin_name = md_table_escape(admin.full_name or "Unknown")
-    md_admin_username = f"@{admin.username}" if admin.username else "Not set"
-    md_lines = [f"## 🛠 {title}", "", "| Field | Value |", "| --- | --- |",
-                f"| Admin | [{md_admin_name}](tg://user?id={admin.id}) |",
-                f"| Admin ID | `{admin.id}` |", f"| Admin Username | {md_admin_username} |"]
-    for label, value in fields:
-        md_lines.append(f"| {label} | `{md_table_escape(value)}` |")
     md_lines.append(f"| Time | {now_str} |")
-    markdown_text = "\n".join(md_lines)
 
-    await send_rich_message(DETAILED_LOG_GROUP_ID, markdown_text, fallback_html=text)
+    await send_rich_message(DETAILED_LOG_GROUP_ID, "\n".join(md_lines), fallback_html="\n".join(html_lines))
 
 @dp.message(Command("groupid"))
 async def cmd_groupid(message: types.Message):
@@ -2089,6 +2227,7 @@ async def supplier_get_key(message: types.Message, state: FSMContext):
     url = data.get("supplier_url")
     await db.set_supplier_config(url, key, is_active=True)
     await state.clear()
+    await send_admin_action_log("SUPPLIER API CONFIGURED", message.from_user, [("API URL", url)])
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
     await message.answer(sc("✅ supplier api configuration saved successfully!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
@@ -2270,6 +2409,7 @@ async def save_tier(message: types.Message, state: FSMContext):
         return
     await db.add_tier(name)
     await state.clear()
+    await send_admin_action_log("TYPE ADDED", message.from_user, [("Type name", name)])
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_cats")]]
     await message.answer(sc(f"✅ type '{name}' added successfully!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
@@ -2318,6 +2458,7 @@ async def save_edited_category(message: types.Message, state: FSMContext):
 
     await db.update_category_name(cat_id, new_name)
     await state.clear()
+    await send_admin_action_log("CATEGORY RENAMED", message.from_user, [("Category ID", cat_id), ("New name", new_name)])
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"admincattier_{tier_id}")]]
     await message.answer(sc(f"✅ category successfully renamed to '{new_name}'!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
@@ -2421,6 +2562,7 @@ async def execute_ban_user(message: types.Message, state: FSMContext):
     action = data.get("ban_action", 1)
     await db.set_user_ban_status(target_id, action)
     await state.clear()
+    await send_admin_action_log("USER BANNED" if action == 1 else "USER UNBANNED", message.from_user, [("Target User ID", target_id)])
     kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_users")]]
     if action == 1:
         await message.answer(sc("✅ user ") + f"`{target_id}`" + sc(" has been successfully banned!"), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -2494,6 +2636,7 @@ async def execute_broadcast(message: types.Message, state: FSMContext):
         sc("✅ broadcast completed!\n\n") + sc(f"- sent   : {sent}\n") + sc(f"- failed : {failed}"),
         parse_mode="Markdown"
     )
+    await send_admin_action_log("BROADCAST SENT", message.from_user, [("Recipients", len(users)), ("Delivered", sent), ("Failed", failed)])
 
 @dp.callback_query(F.data == "admin_del_acc_list")
 async def admin_del_acc_list(callback: types.CallbackQuery):
@@ -2517,7 +2660,13 @@ async def delete_account_action(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     acc_id = int(callback.data.split("_")[1])
+    old = await db.get_account_by_id(acc_id)
     await db.delete_account(acc_id)
+    if old:
+        await send_admin_action_log("STOCK ACCOUNT DELETED", callback.from_user, [
+            ("Account ID", acc_id), ("Number", mask_phone_number(str(old.get("phone_number", "")))),
+            ("Name", old.get("display_name", "—")), ("Price", f"₹{old.get('price', 0)}"),
+        ])
     await callback.answer(sc("✅ account successfully deleted!"), show_alert=True)
     await admin_del_acc_list(callback)
 
@@ -2547,6 +2696,7 @@ async def save_cat(message: types.Message, state: FSMContext):
 
     cat_id = await db.add_category(message.text, tier_id)
     await state.clear()
+    await send_admin_action_log("CATEGORY ADDED", message.from_user, [("Category", message.text), ("Type", label)])
     kb = [
         [InlineKeyboardButton(text=sc("➕ Add Account Here"), callback_data=f"selcat_{cat_id}")],
         [InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"admincattier_{tier_id}")]
@@ -2811,6 +2961,7 @@ async def _handle_login_result(message: types.Message, state: FSMContext, status
         telegram_user_id=info["user_id"],
         two_step_enabled=info["two_step_enabled"],
         two_step=info.get("two_step_password", ""),
+        added_via="phone",
     )
     status_line = sc("on") if info["two_step_enabled"] else sc("off")
     await bot.send_message(
@@ -2832,10 +2983,12 @@ async def get_session(message: types.Message, state: FSMContext):
     checking_msg = await message.answer(sc("🔍 reading session, please wait..."))
     work_dir = tempfile.mkdtemp(prefix="sess_")
     info, error = None, None
+    added_via = "string"
 
     try:
         if message.document:
             fname = (message.document.file_name or "").lower()
+            added_via = "zip" if fname.endswith(".zip") else "file"
             local_path = os.path.join(work_dir, message.document.file_name or "upload.bin")
             await bot.download(message.document, destination=local_path)
 
@@ -2873,6 +3026,7 @@ async def get_session(message: types.Message, state: FSMContext):
         phone_number=info["phone_number"],
         telegram_user_id=info["user_id"],
         two_step_enabled=info["two_step_enabled"],
+        added_via=added_via,
     )
 
     status_line = sc("on") if info["two_step_enabled"] else sc("off")
@@ -2899,7 +3053,7 @@ async def get_two_step(message: types.Message, state: FSMContext):
 async def finalize_add_account(message: types.Message, state: FSMContext):
     data = await state.get_data()
     try:
-        await db.add_account(
+        new_acc_id = await db.add_account(
             data["category_id"],
             data["display_name"],
             data["phone_number"],
@@ -2908,12 +3062,20 @@ async def finalize_add_account(message: types.Message, state: FSMContext):
             two_step=data.get("two_step", ""),
             telegram_user_id=data.get("telegram_user_id"),
             two_step_enabled=data.get("two_step_enabled", False),
+            added_by=message.from_user.id,
+            added_via=data.get("added_via"),
         )
     except ValueError as e:
         await state.clear()
         await message.answer(sc("❌ could not add account: ") + f"{e}")
         return
     await state.clear()
+    via_label = {"string": "Session string", "file": ".session file", "zip": "Zip file", "phone": "Phone login"}.get(data.get("added_via"), "—")
+    await send_admin_action_log("ACCOUNT ADDED", message.from_user, [
+        ("Account ID", new_acc_id), ("Number", mask_phone_number(str(data["phone_number"]))),
+        ("Name", data["display_name"]), ("Price", f"₹{data['price']}"), ("Method", via_label),
+        ("2-step", "On" if data.get("two_step_enabled") else "Off"),
+    ])
     kb = [
         [InlineKeyboardButton(text=sc("➕ Add Another"), callback_data="admin_add_acc")],
         [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]
@@ -2950,6 +3112,8 @@ async def run_mass_join(target: str, accounts: list, admin_chat_id: int):
     except Exception as e:
         print(f"Mass-join summary send error: {e}")
 
+    await send_admin_action_log("MASS JOIN FINISHED", None, [("Target", target), ("Joined", success), ("Failed", failed)])
+
 @dp.message(Command("join"))
 async def cmd_join_channel(message: types.Message):
     if not is_owner_level(message.from_user.id):
@@ -2972,6 +3136,7 @@ async def cmd_join_channel(message: types.Message):
         f"I'll send a summary here once it's done.",
         parse_mode="Markdown"
     )
+    await send_admin_action_log("MASS JOIN STARTED (/join)", message.from_user, [("Target", target), ("Accounts", len(accounts))])
     asyncio.create_task(run_mass_join(target, accounts, message.chat.id))
 
 LOGOUT_DELAY_MIN = 1
@@ -3093,6 +3258,7 @@ async def logoutall_confirm(callback: types.CallbackQuery):
         _logout_all_running = False
         raise
     await callback.answer()
+    await send_admin_action_log("LOGOUT-ALL CONFIRMED (/logoutall)", callback.from_user, [("Accounts", len(accounts))])
     asyncio.create_task(_run_logout_all_guarded(accounts, callback.message.chat.id))
 
 
@@ -3114,7 +3280,7 @@ async def cmd_add_balance(message: types.Message):
         await message.answer("❌ Amount must be greater than 0.")
         return
 
-    await db.update_balance(target_id, amount)
+    await db.update_balance(target_id, amount, reason="admin_credit", by=message.from_user.id)
     await db.save_payment_record(target_id, amount, "ADMIN", "ADMIN_CREDIT")
     await message.answer(f"✅ Added ₹{amount:.2f} to user `{target_id}`'s balance.", parse_mode="Markdown")
 
@@ -3152,7 +3318,7 @@ async def cmd_deduct_balance(message: types.Message):
         await message.answer("❌ Amount must be greater than 0.")
         return
 
-    await db.update_balance(target_id, -amount)
+    await db.update_balance(target_id, -amount, reason="admin_debit", by=message.from_user.id)
     await db.save_payment_record(target_id, amount, "ADMIN", "ADMIN_DEBIT")
     await message.answer(f"✅ Deducted ₹{amount:.2f} from user `{target_id}`'s balance.", parse_mode="Markdown")
 
@@ -3171,6 +3337,358 @@ async def cmd_deduct_balance(message: types.Message):
         [("Target User ID", target_id), ("Amount Deducted", f"₹{amount:.2f}"),
          ("New Balance", f"₹{new_user.get('balance', 0):.2f}")]
     )
+
+# ---------------- Records & reports: /user /ledger /acc /stats /auditlog ----------------
+LEDGER_REASONS = {
+    "deposit_topup": "Deposit approved", "gplay_topup": "Google Play top-up", "stars_topup": "Stars top-up",
+    "admin_credit": "Admin credit (/dd)", "admin_debit": "Admin debit (/ss)", "purchase": "Account purchase",
+    "purchase_refund": "Purchase refund", "referral_bonus": "Referral bonus", "manual": "Manual change",
+}
+ADDED_VIA_LABELS = {"string": "Session string", "file": ".session file", "zip": "Zip file", "phone": "Phone login"}
+
+
+def _money(v) -> str:
+    s = f"{float(v or 0):.3f}".rstrip("0").rstrip(".")
+    return f"₹{s or '0'}"
+
+
+def _delta(v) -> str:
+    s = f"{float(v or 0):+.3f}".rstrip("0").rstrip(".")
+    return s
+
+
+async def _raw_user_name(uid: int) -> str:
+    """'Name @username' if the bot can see this user, else ''. (plain text, not escaped)"""
+    try:
+        chat = await bot.get_chat(uid)
+        name = chat.full_name or chat.first_name or ""
+        return f"{name} @{chat.username}".strip() if chat.username else name
+    except Exception:
+        return ""
+
+
+@dp.message(Command("user"))
+async def cmd_user(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Usage: /user <user_id>\nExample: /user 123456789")
+        return
+    uid = int(parts[1])
+    user = await db.users_col.find_one({"user_id": uid})
+    if not user:
+        await message.answer("❌ No user with this ID (they never started the bot).")
+        return
+
+    orders, spent, dep_count, deposited = await db.get_user_totals(uid)
+    recent = await db.get_user_orders(uid, 3)
+    who = await _raw_user_name(uid)
+    rows = [
+        ("User ID", uid, "code"),
+        ("Name", who or "—"),
+        ("Balance", _money(user.get("balance", 0)), "bold"),
+        ("Joined", fmt_ts(user["created_at"]) if user.get("created_at") else "before tracking started"),
+        ("Verified", "Yes" if user.get("is_verified") else "No"),
+        ("Banned", "🚫 Yes" if user.get("is_banned") else "No"),
+        ("Referred by", user.get("referred_by") or "—", "code"),
+        ("Referrals", user.get("referral_count", 0)),
+        ("Orders", orders),
+        ("Total spent", _money(spent)),
+        ("Deposits", f"{dep_count} ({_money(deposited)})"),
+    ]
+    for acc in recent:
+        rows.append(("Order", f"#{acc['account_id']} · {mask_phone_number(str(acc.get('phone_number', '')))} · {_money(acc.get('price', 0))} · {fmt_ts(acc.get('sold_at'))}"))
+    await send_rich_table(message.chat.id, f"👤 User {uid}", rows, footer="Full balance history: /ledger followed by the user id")
+
+
+@dp.message(Command("ledger"))
+async def cmd_ledger(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) not in (2, 3) or not parts[1].isdigit():
+        await message.answer("Usage: /ledger <user_id> [count]\nExample: /ledger 123456789 20")
+        return
+    uid = int(parts[1])
+    n = 15
+    if len(parts) == 3 and parts[2].isdigit():
+        n = max(1, min(30, int(parts[2])))
+    user = await db.users_col.find_one({"user_id": uid})
+    if not user:
+        await message.answer("❌ No user with this ID.")
+        return
+
+    entries = await db.get_user_ledger(uid, n)
+    rows = [[
+        fmt_ts(e.get("ts")), _delta(e.get("delta")), LEDGER_REASONS.get(e.get("reason"), e.get("reason", "—")),
+        _money(e["balance_after"]) if e.get("balance_after") is not None else "—",
+        str(e["by"]) if e.get("by") else "system",
+    ] for e in entries]
+    footer = f"Current balance {_money(user.get('balance', 0))} · latest {len(entries)} entries"
+    if not entries:
+        footer += " · history is recorded from this update onwards"
+    await send_rich_grid(message.chat.id, f"💳 Ledger — {uid}", ["Time", "Change", "Reason", "Balance after", "By"], rows, footer=footer)
+
+
+@dp.message(Command("acc"))
+async def cmd_acc(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /acc <phone number or account id>\nExample: /acc 919876543210")
+        return
+    acc = await db.find_account(parts[1])
+    if not acc:
+        await message.answer("❌ Account not found.")
+        return
+
+    cat = await db.get_category_by_id(acc.get("category_id"))
+    otp = await db.get_otp_delivery_count(acc["account_id"])
+    if acc.get("session_dead"):
+        status = "☠️ Dead session (hidden from shop)"
+    elif acc.get("is_sold"):
+        status = "✅ Sold"
+    elif acc.get("session_revoked"):
+        status = "🚪 Bot logged out"
+    else:
+        status = "🟢 In stock"
+    rows = [
+        ("Account ID", acc["account_id"], "code"),
+        ("Number", acc.get("phone_number"), "code"),
+        ("Name", acc.get("display_name")),
+        ("Category", cat["name"] if cat else "—"),
+        ("Price", _money(acc.get("price", 0)), "bold"),
+        ("Status", status),
+        ("2-step", "On" if acc.get("two_step_enabled") else "Off"),
+        ("Added by", acc.get("added_by") or "unknown", "code"),
+        ("Added via", ADDED_VIA_LABELS.get(acc.get("added_via"), "unknown")),
+        ("Added at", fmt_ts(acc["added_at"]) if acc.get("added_at") else "before tracking started"),
+    ]
+    if acc.get("is_sold"):
+        rows += [("Sold to", acc.get("sold_to"), "code"), ("Sold at", fmt_ts(acc.get("sold_at")))]
+    rows.append(("OTP deliveries", otp))
+    if acc.get("last_checked_at"):
+        rows.append(("Last session check", fmt_ts(acc["last_checked_at"])))
+    if acc.get("dead_reason"):
+        rows.append(("Dead reason", acc["dead_reason"]))
+    await send_rich_table(message.chat.id, f"📱 Account #{acc['account_id']}", rows)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    now_utc = datetime.now(timezone.utc)
+    start_today = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    d = await db.get_dashboard(start_today, now_utc - timedelta(days=7), now_utc - timedelta(days=30))
+
+    def sales(key):
+        c, t = d[key]
+        return f"{c} sold · {_money(t)}"
+
+    def topup(key):
+        c, t = d[key]
+        return f"{c} top-ups · {_money(t)}"
+
+    rows = [
+        ("Users", f"{d['users_total']} total · {d['users_banned']} banned"),
+        ("New users", f"{d['users_today']} today · {d['users_7d']} in 7 days"),
+        ("Stock available", d["stock"], "bold"),
+        ("Dead sessions", d["dead"]),
+        ("Sold (all time)", d["sold_total"]),
+        ("Sales today", sales("sales_today")),
+        ("Sales 7 days", sales("sales_7d")),
+        ("Sales 30 days", sales("sales_30d")),
+        ("Top-ups today", topup("topup_today")),
+        ("Top-ups 7 days", topup("topup_7d")),
+        ("Top-ups 30 days", topup("topup_30d")),
+        ("Pending deposits", d["pending_deposits"]),
+        ("Pending Google Play", d["pending_gp"]),
+    ]
+    await send_rich_table(message.chat.id, "📊 Shop stats", rows,
+                          footer=f"Today = since 12:00 AM IST · new-user counts start from the update that added them · {fmt_ts(now_utc)}")
+
+    cats = await db.get_categories_with_counts()
+    if cats:
+        cats = sorted(cats, key=lambda c: c[2], reverse=True)[:15]
+        await send_rich_grid(message.chat.id, "📦 Stock by category", ["Category", "In stock"], [[c[1], c[2]] for c in cats])
+
+
+@dp.message(Command("auditlog"))
+async def cmd_auditlog(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    n = 15
+    if len(parts) == 2 and parts[1].isdigit():
+        n = max(1, min(25, int(parts[1])))
+    entries = await db.get_audit(n)
+    rows = []
+    for e in entries:
+        details = "; ".join(f"{l}: {v}" for l, v in e.get("fields", []))
+        if len(details) > 90:
+            details = details[:87] + "..."
+        who = e.get("admin_name") or "System"
+        if e.get("admin_id"):
+            who += f" ({e['admin_id']})"
+        rows.append([fmt_ts(e.get("ts")), who, e.get("action", "—"), details or "—"])
+    await send_rich_grid(message.chat.id, "🧾 Audit log", ["Time", "Admin", "Action", "Details"], rows, footer=f"Latest {len(entries)} admin actions")
+
+
+# ---------------- Daily jobs: session check (5 AM IST) and backup (10 PM IST) ----------------
+SESSION_CHECK_HOUR_IST = 5
+BACKUP_HOUR_IST = 22
+BACKUP_SECRET_FIELDS = {"session_string", "two_step", "api_key"}
+_session_check_running = False
+_background_tasks = []
+
+
+def owner_level_ids() -> list:
+    return [OWNER_ID] + ([CO_OWNER_ID] if CO_OWNER_ID else [])
+
+
+async def run_session_check(trigger: str = "auto"):
+    """Opens every unsold account's session once, flags dead ones (they disappear from
+    the shop) and DMs a report to the owner and co-owner."""
+    global _session_check_running
+    if _session_check_running:
+        return False
+    _session_check_running = True
+    started = datetime.now(timezone.utc)
+    alive, skipped, dead, unknown = 0, 0, [], []
+    try:
+        accounts = await db.get_accounts_for_session_check()
+        for acc in accounts:
+            if acc.get("phone_number") in active_clients:   # live OTP client uses this session - don't touch
+                skipped += 1
+                continue
+            status, reason = await check_session_alive(acc["session_string"])
+            if status == "alive":
+                alive += 1
+                await db.mark_session_ok(acc["account_id"])
+            elif status == "dead":
+                await db.mark_session_dead(acc["account_id"], reason)
+                dead.append((acc, reason))
+            else:
+                unknown.append((acc, reason))
+            await asyncio.sleep(random.uniform(1.5, 3.5))
+    finally:
+        _session_check_running = False
+
+    secs = int((datetime.now(timezone.utc) - started).total_seconds())
+    rows = [
+        ("Trigger", f"Scheduled ({SESSION_CHECK_HOUR_IST}:00 AM IST)" if trigger == "auto" else "Manual (/checksessions)"),
+        ("Checked", len(accounts)),
+        ("Alive", alive),
+        ("Dead (hidden from shop)", len(dead), "bold"),
+        ("Could not check", len(unknown)),
+        ("Skipped (in use)", skipped),
+        ("Duration", f"{secs}s"),
+    ]
+    for chat_id in owner_level_ids():
+        await send_rich_table(chat_id, "🩺 Session check report", rows)
+        if dead:
+            await send_rich_grid(
+                chat_id, "☠️ Dead sessions", ["ID", "Number", "Reason"],
+                [[a["account_id"], mask_phone_number(str(a.get("phone_number", ""))), r] for a, r in dead[:25]],
+                footer="These accounts are hidden from the shop. Delete them from Admin Panel → Delete Stock."
+            )
+        if unknown:
+            await send_rich_grid(
+                chat_id, "⚠️ Could not check (not flagged)", ["ID", "Number", "Reason"],
+                [[a["account_id"], mask_phone_number(str(a.get("phone_number", ""))), r] for a, r in unknown[:10]]
+            )
+    return True
+
+
+async def run_backup(trigger: str = "auto"):
+    """Dumps the whole database to one compressed file and posts it to the private admin group
+    (owner DM if no group is set). With BACKUP_KEY the file is encrypted and includes sessions;
+    without it session strings / 2FA / API keys are left out so nothing sensitive reaches the group."""
+    from bson import json_util
+
+    fernet = None
+    if BACKUP_KEY:
+        try:
+            from cryptography.fernet import Fernet
+            fernet = Fernet(BACKUP_KEY.encode())
+        except Exception as e:
+            print(f"BACKUP_KEY unusable ({e}) - sending a redacted backup instead")
+
+    dump, counts = {}, {}
+    for name in sorted(await db.db.list_collection_names()):
+        docs = await db.db[name].find({}).to_list(length=None)
+        if not fernet:
+            docs = [{k: v for k, v in d.items() if k not in BACKUP_SECRET_FIELDS} for d in docs]
+        dump[name] = docs
+        counts[name] = len(docs)
+
+    raw = gzip.compress(json_util.dumps(dump).encode("utf-8"))
+    stamp = datetime.now(IST).strftime("%Y%m%d_%H%M")
+    if fernet:
+        data, filename = fernet.encrypt(raw), f"backup_{stamp}.json.gz.enc"
+    else:
+        data, filename = raw, f"backup_{stamp}.json.gz"
+
+    target = DETAILED_LOG_GROUP_ID or OWNER_ID
+    rows = [
+        ("Trigger", f"Scheduled ({BACKUP_HOUR_IST}:00 PM IST)" if trigger == "auto" else "Manual (/backup)"),
+        ("Collections", len(counts)),
+        ("Documents", sum(counts.values())),
+        ("File", f"{filename} ({len(data) / 1024:.0f} KB)"),
+        ("Sessions / 2FA / API keys", "Included, encrypted with BACKUP_KEY" if fernet else "Left out (set BACKUP_KEY to include them, encrypted)"),
+    ]
+    await send_rich_table(target, "💾 Database backup", rows)
+    if len(data) > 45 * 1024 * 1024:
+        await bot.send_message(target, "⚠️ The backup is too large to send through Telegram (over 45 MB).")
+        return
+    await bot.send_document(target, types.BufferedInputFile(data, filename=filename), caption=f"💾 {filename}")
+
+
+def seconds_until_ist(hour: int) -> float:
+    now = datetime.now(IST)
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def daily_job_loop(name: str, hour: int, job):
+    while True:
+        await asyncio.sleep(seconds_until_ist(hour))
+        try:
+            await job("auto")
+        except Exception as e:
+            print(f"Daily job '{name}' failed: {e}")
+        await asyncio.sleep(90)   # never run twice in the same minute
+
+
+@dp.message(Command("checksessions"))
+async def cmd_checksessions(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    if _session_check_running:
+        await message.answer("⏳ A session check is already running. The report will arrive in your DM.")
+        return
+    await message.answer("🩺 Session check started. It opens each unsold account once, so it can take a while — the report will arrive here when done.")
+    await send_admin_action_log("SESSION CHECK STARTED (/checksessions)", message.from_user, [])
+    _background_tasks.append(asyncio.create_task(run_session_check("manual")))
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    await message.answer("💾 Creating backup...")
+    try:
+        await run_backup("manual")
+    except Exception as e:
+        await message.answer(f"❌ Backup failed: {e}")
+        return
+    await send_admin_action_log("BACKUP CREATED (/backup)", message.from_user, [])
+
 
 # ---------------- Payment settings: /setqr /setupi /removeqr /removeupi ----------------
 # Only the owner / co-owner can use these.
@@ -3400,7 +3918,23 @@ async def main():
     DYNAMIC_ADMINS.update(a["user_id"] for a in await db.get_admins())
     await set_bot_commands(bot)
     asyncio.create_task(cleanup_idle_clients())
-    await dp.start_polling(bot)
+    _background_tasks.append(asyncio.create_task(daily_job_loop("session-check", SESSION_CHECK_HOUR_IST, run_session_check)))
+    _background_tasks.append(asyncio.create_task(daily_job_loop("backup", BACKUP_HOUR_IST, run_backup)))
+
+    # aiogram already retries transient network errors (connection reset,
+    # timeouts, etc.) forever inside start_polling without us doing anything.
+    # This outer loop is a second safety net: if polling ever stops for a
+    # reason aiogram itself doesn't recover from, we log it and restart
+    # instead of the whole bot going silently dead until someone notices.
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break  # a clean, intentional stop (e.g. Ctrl+C) — don't restart
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Polling stopped unexpectedly - restarting in 5s")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     # Render free web service needs an open $PORT + keep-awake pings.
