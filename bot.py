@@ -123,6 +123,16 @@ def all_admin_ids() -> list:
     return ids
 
 
+# Payment settings stored in MongoDB (set with /setqr and /setupi)
+SETTING_QR_FILE_ID = "upi_qr_file_id"
+SETTING_UPI_ID = "upi_id"
+
+
+async def get_upi_id() -> str:
+    """UPI id from /setupi, falling back to the UPI_ID env variable."""
+    return (await db.get_setting(SETTING_UPI_ID)) or UPI_ID
+
+
 # ---------------- Ban middleware (applies to all handlers) ----------------
 class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -215,13 +225,17 @@ async def set_bot_commands(bot_instance: Bot):
         BotCommand(command="add", description="Add new account ➕"),
         BotCommand(command="groupid", description="Get this chat's ID 🆔"),
         BotCommand(command="checkchannels", description="Diagnose required-channel membership checks 🔍"),
-        BotCommand(command="join", description="Join all accounts to a channel 📢"),
-        BotCommand(command="logoutall", description="Log bot out of all accounts 🚪"),
         BotCommand(command="dd", description="Add balance to a user 💰"),
         BotCommand(command="ss", description="Deduct balance from a user 💸"),
     ]
     # Only owner / co-owner can manage admins, so only they see these.
     owner_extra_commands = [
+        BotCommand(command="setqr", description="Reply to a QR photo with /setqr to set deposit QR 🖼"),
+        BotCommand(command="setupi", description="Set UPI ID: /setupi <upi_id> 🆔"),
+        BotCommand(command="removeqr", description="Remove the deposit QR 🗑"),
+        BotCommand(command="removeupi", description="Remove the custom UPI ID 🗑"),
+        BotCommand(command="join", description="Join all accounts to a channel 📢"),
+        BotCommand(command="logoutall", description="Log bot out of all accounts 🚪"),
         BotCommand(command="addadmin", description="Add an admin: /addadmin <user_id> ➕"),
         BotCommand(command="removeadmin", description="Remove an admin: /removeadmin <user_id> ➖"),
         BotCommand(command="checkadmins", description="List all admins 👮"),
@@ -979,18 +993,29 @@ async def deposit_pick_upi(callback: types.CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(DepositState.waiting_for_screenshot)
+    upi_id = await get_upi_id()
     caption = (
         f"📱 **ᴜᴘɪ ᴘᴀʏᴍᴇɴᴛ**\n\n"
         f"**Step 3/3 — Pay & Confirm**\n\n"
         f"💰 Amount: ₹{amount}\n"
-        f"🆔 UPI ID: `{UPI_ID}`\n\n"
+        f"🆔 UPI ID: `{upi_id}`\n\n"
         f"Pay using the QR code and send the screenshot."
     )
-    try:
-        photo = types.FSInputFile(UPI_QR_IMAGE_PATH)
-        await callback.message.answer_photo(photo, caption=caption, parse_mode="Markdown", reply_markup=gp_cancel_kb())
-    except Exception:
-        await callback.message.answer(caption, parse_mode="Markdown", reply_markup=gp_cancel_kb())
+
+    sent = False
+    qr_file_id = await db.get_setting(SETTING_QR_FILE_ID)   # set by /setqr
+    if qr_file_id:
+        try:
+            await callback.message.answer_photo(qr_file_id, caption=caption, parse_mode="Markdown", reply_markup=gp_cancel_kb())
+            sent = True
+        except Exception as e:
+            print(f"Saved QR could not be sent: {e}")
+    if not sent:
+        try:   # old behaviour: QR image file next to bot.py
+            photo = types.FSInputFile(UPI_QR_IMAGE_PATH)
+            await callback.message.answer_photo(photo, caption=caption, parse_mode="Markdown", reply_markup=gp_cancel_kb())
+        except Exception:
+            await callback.message.answer(caption, parse_mode="Markdown", reply_markup=gp_cancel_kb())
     await callback.answer()
 
 @dp.message(DepositState.waiting_for_screenshot)
@@ -2927,7 +2952,7 @@ async def run_mass_join(target: str, accounts: list, admin_chat_id: int):
 
 @dp.message(Command("join"))
 async def cmd_join_channel(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if not is_owner_level(message.from_user.id):
         return
     args = message.text.split(maxsplit=1)
     if len(args) != 2:
@@ -2985,21 +3010,91 @@ async def run_mass_logout(accounts: list, admin_chat_id: int):
     except Exception as e:
         print(f"Mass-logout summary send error: {e}")
 
+_logout_all_running = False
+LOGOUT_CONFIRM_SECONDS = 120   # the confirm button stops working after 2 minutes
+
+
+async def _run_logout_all_guarded(accounts: list, admin_chat_id: int):
+    global _logout_all_running
+    try:
+        await run_mass_logout(accounts, admin_chat_id)
+    finally:
+        _logout_all_running = False
+
+
 @dp.message(Command("logoutall"))
 async def cmd_logout_all(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if not is_owner_level(message.from_user.id):
+        return
+    if _logout_all_running:
+        await message.answer("⏳ A mass-logout is already running. Wait for its summary.")
         return
     accounts = await db.get_all_accounts_with_sessions()
     if not accounts:
         await message.answer("❌ No accounts with an active session found in the database.")
         return
 
+    ts = int(datetime.now(timezone.utc).timestamp())
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, log out all", callback_data=f"lo_yes:{ts}")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="lo_no")],
+    ])
     await message.answer(
-        f"🚨 Logging the bot out of **{len(accounts)}** accounts (only the bot's own session — no other device is touched).\n"
-        f"I'll send a summary here once it's done.",
-        parse_mode="Markdown"
+        f"⚠️ <b>Log the bot out of {len(accounts)} accounts?</b>\n\n"
+        f"This ends the bot's own session on EVERY account and clears the session "
+        f"strings from the database. This cannot be undone.\n\n"
+        f"Confirm within 2 minutes.",
+        parse_mode="HTML",
+        reply_markup=kb
     )
-    asyncio.create_task(run_mass_logout(accounts, message.chat.id))
+
+
+@dp.callback_query(F.data == "lo_no")
+async def logoutall_cancel(callback: types.CallbackQuery):
+    if not is_owner_level(callback.from_user.id):
+        await callback.answer("Not allowed.", show_alert=True)
+        return
+    await callback.message.edit_text("❎ Cancelled. Nobody was logged out.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("lo_yes:"))
+async def logoutall_confirm(callback: types.CallbackQuery):
+    global _logout_all_running
+    if not is_owner_level(callback.from_user.id):
+        await callback.answer("Not allowed.", show_alert=True)
+        return
+
+    try:
+        ts = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        ts = 0
+    if datetime.now(timezone.utc).timestamp() - ts > LOGOUT_CONFIRM_SECONDS:
+        await callback.message.edit_text("⌛ Confirmation expired. Send /logoutall again if you still want this.")
+        await callback.answer()
+        return
+
+    if _logout_all_running:
+        await callback.answer("A mass-logout is already running.", show_alert=True)
+        return
+    _logout_all_running = True   # set before any await so a double-tap can't start two runs
+    try:
+        accounts = await db.get_all_accounts_with_sessions()
+        if not accounts:
+            _logout_all_running = False
+            await callback.message.edit_text("❌ No accounts with an active session found in the database.")
+            await callback.answer()
+            return
+        await callback.message.edit_text(
+            f"🚨 Logging the bot out of {len(accounts)} accounts (only the bot's own session — no other device is touched).\n"
+            f"I'll send a summary here once it's done."
+        )
+    except Exception:
+        _logout_all_running = False
+        raise
+    await callback.answer()
+    asyncio.create_task(_run_logout_all_guarded(accounts, callback.message.chat.id))
+
 
 @dp.message(Command("dd"))
 async def cmd_add_balance(message: types.Message):
@@ -3076,6 +3171,115 @@ async def cmd_deduct_balance(message: types.Message):
         [("Target User ID", target_id), ("Amount Deducted", f"₹{amount:.2f}"),
          ("New Balance", f"₹{new_user.get('balance', 0):.2f}")]
     )
+
+# ---------------- Payment settings: /setqr /setupi /removeqr /removeupi ----------------
+# Only the owner / co-owner can use these.
+UPI_ID_RE = re.compile(r"[A-Za-z0-9._\-]{2,64}@[A-Za-z][A-Za-z0-9]{1,30}")
+
+
+def _confirm_kb(yes_data: str, no_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, remove", callback_data=yes_data)],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data=no_data)],
+    ])
+
+
+@dp.message(Command("setqr"))
+async def cmd_setqr(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    replied = message.reply_to_message
+    if not replied or not replied.photo:
+        await message.answer(
+            "ℹ️ Send the QR screenshot to this chat first, then reply to it with /setqr.\n"
+            "(Send it as a photo, not as a file.)"
+        )
+        return
+
+    file_id = replied.photo[-1].file_id
+    await db.set_setting(SETTING_QR_FILE_ID, file_id)
+
+    try:
+        await message.answer_photo(file_id, caption="✅ QR saved. Users will see this when they pay with UPI.")
+    except Exception:
+        await message.answer("✅ QR saved. Users will see it when they pay with UPI.")
+
+    await send_admin_action_log("PAYMENT QR UPDATED (/setqr)", message.from_user, [("Set by", message.from_user.id)])
+
+
+@dp.message(Command("setupi"))
+async def cmd_setupi(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not UPI_ID_RE.fullmatch(parts[1]):
+        await message.answer("Usage: /setupi <upi_id>\nExample: /setupi name@okaxis")
+        return
+
+    upi = parts[1]
+    await db.set_setting(SETTING_UPI_ID, upi)
+    await message.answer(f"✅ UPI ID saved: <code>{html.escape(upi)}</code>\nIt is shown with the QR on the deposit screen.", parse_mode="HTML")
+    await send_admin_action_log("UPI ID UPDATED (/setupi)", message.from_user, [("New UPI ID", upi)])
+
+
+@dp.message(Command("removeqr"))
+async def cmd_removeqr(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    if not await db.get_setting(SETTING_QR_FILE_ID):
+        await message.answer("ℹ️ No QR is set right now.")
+        return
+    await message.answer(
+        "⚠️ Remove the saved deposit QR?\nUsers will not see a QR on the UPI screen until you set a new one with /setqr.",
+        reply_markup=_confirm_kb("rmqr_yes", "rmqr_no")
+    )
+
+
+@dp.callback_query(F.data.in_({"rmqr_yes", "rmqr_no"}))
+async def removeqr_answer(callback: types.CallbackQuery):
+    if not is_owner_level(callback.from_user.id):
+        await callback.answer("Not allowed.", show_alert=True)
+        return
+    if callback.data == "rmqr_no":
+        await callback.message.edit_text("❎ Cancelled. The QR was not removed.")
+    else:
+        removed = await db.delete_setting(SETTING_QR_FILE_ID)
+        await callback.message.edit_text("✅ QR removed." if removed else "ℹ️ No QR was set.")
+        if removed:
+            await send_admin_action_log("PAYMENT QR REMOVED (/removeqr)", callback.from_user, [("Removed by", callback.from_user.id)])
+    await callback.answer()
+
+
+@dp.message(Command("removeupi"))
+async def cmd_removeupi(message: types.Message):
+    if not is_owner_level(message.from_user.id):
+        return
+    current = await db.get_setting(SETTING_UPI_ID)
+    if not current:
+        await message.answer(f"ℹ️ No custom UPI ID is set (the default from the UPI_ID variable is used: {UPI_ID}).")
+        return
+    await message.answer(
+        f"⚠️ Remove the saved UPI ID?\n\n{current}\n\nThe default from the UPI_ID variable ({UPI_ID}) will be shown instead.",
+        reply_markup=_confirm_kb("rmupi_yes", "rmupi_no")
+    )
+
+
+@dp.callback_query(F.data.in_({"rmupi_yes", "rmupi_no"}))
+async def removeupi_answer(callback: types.CallbackQuery):
+    if not is_owner_level(callback.from_user.id):
+        await callback.answer("Not allowed.", show_alert=True)
+        return
+    if callback.data == "rmupi_no":
+        await callback.message.edit_text("❎ Cancelled. The UPI ID was not removed.")
+    else:
+        removed = await db.delete_setting(SETTING_UPI_ID)
+        await callback.message.edit_text(
+            f"✅ UPI ID removed. Now showing the default: {UPI_ID}" if removed else "ℹ️ No custom UPI ID was set."
+        )
+        if removed:
+            await send_admin_action_log("UPI ID REMOVED (/removeupi)", callback.from_user, [("Removed by", callback.from_user.id)])
+    await callback.answer()
+
 
 # ---------------- Admin management: /addadmin /removeadmin /checkadmins ----------------
 # Only the owner / co-owner (from env) can use these.

@@ -20,6 +20,7 @@ deposit_requests_col = db["deposit_requests"]
 otp_logs_col = db["otp_logs"]
 joined_channels_col = db["joined_channels"]
 admins_col = db["admins"]
+settings_col = db["settings"]
 
 
 async def get_next_sequence(name: str) -> int:
@@ -523,4 +524,23 @@ async def remove_admin(user_id: int) -> bool:
 async def get_admins() -> list:
     """List of admin docs, oldest first."""
     return [a async for a in admins_col.find({}).sort("added_at", 1)]
+
+
+# ---------------- Simple key/value settings (payment QR, UPI id, ...) ----------------
+async def get_setting(key: str, default=None):
+    doc = await settings_col.find_one({"_id": key})
+    return doc["value"] if doc and "value" in doc else default
+
+
+async def set_setting(key: str, value) -> None:
+    await settings_col.update_one(
+        {"_id": key},
+        {"$set": {"value": value, "updated_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+
+
+async def delete_setting(key: str) -> bool:
+    result = await settings_col.delete_one({"_id": key})
+    return result.deleted_count > 0
 
